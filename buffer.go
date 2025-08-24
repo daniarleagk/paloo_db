@@ -18,44 +18,41 @@ var ErrFrameHashTableError = errors.New("paloo_db: frame not found in hash table
 
 // EvictionPolicy is interface for buffer eviction policy.
 type EvictionPolicy[I DbObjectId, O any] interface {
-	register(frame *Frame[I, O])                         // register
-	selectVictim(bf *Buffer[I, O]) (*Frame[I, O], error) // select a victim page to evict
+	Register(frame *Frame[I, O])                         // register
+	SelectVictim(bf *Buffer[I, O]) (*Frame[I, O], error) // select a victim page to evict
 }
 
 // ClockEvictionPolicy is a basic clock eviction policy.
 type ClockEvictionPolicy[I DbObjectId, O any] struct {
 	clockPointer atomic.Int32
-	framesBits   []atomic.Bool // reference bits for each frame
-	maxLoops     int           // max loops for checking reference
+	maxLoops     int // max loops for checking reference
 	//  bits if after two check still no false bit found take the next unfixed frame at most with one additional loop
 }
 
-func NewClockEvictionPolicy[I DbObjectId, O any](size int) *ClockEvictionPolicy[I, O] {
+func NewClockEvictionPolicy[I DbObjectId, O any]() *ClockEvictionPolicy[I, O] {
 	return &ClockEvictionPolicy[I, O]{
-		clockPointer: atomic.Int32{},            // initialize the clock pointer to 0
-		framesBits:   make([]atomic.Bool, size), // initialize reference bits for each frame
+		clockPointer: atomic.Int32{}, // initialize the clock pointer to 0
 		maxLoops:     2,
 	}
 }
 
-func (c *ClockEvictionPolicy[I, O]) register(frame *Frame[I, O]) {
-	// register the frame by setting its reference bit to true
-	c.framesBits[frame.index].Store(true) // set the reference bit for the frame
+func (c *ClockEvictionPolicy[I, O]) Register(frame *Frame[I, O]) {
+	// does nothing since FIX sets refBit
 }
 
-func (c *ClockEvictionPolicy[I, O]) selectVictim(bf *Buffer[I, O]) (*Frame[I, O], error) {
+func (c *ClockEvictionPolicy[I, O]) SelectVictim(bf *Buffer[I, O]) (*Frame[I, O], error) {
 	// select a victim frame using the clock algorithm
-	size := len(c.framesBits)
+	size := len(bf.frames)
 	atomicPointer := c.clockPointer.Load() // get the current clock pointer
 	atomicPointer %= int32(size)           // ensure the pointer is within bounds
 	for i := int(atomicPointer); i < (size*c.maxLoops + 1); i++ {
 		index := int(i) % size // calculate the index of the frame to check
+		frame := bf.frames[index]
 		// update the clock pointer to the next index
-		if c.framesBits[index].CompareAndSwap(true, false) { // if the reference bit is set, clear it and continue
+		if frame.refBit.CompareAndSwap(true, false) { // if the reference bit is set, clear it and continue
 			c.clockPointer.Store(int32(index + 1))
 		} else { // false if the reference bit is not set, it means the frame is not in use
-			frame := bf.frames[index] // get the frame from the buffer manager
-			if frame.IsUnfixed() {    // if the frame is not fixed, return it as a victim
+			if frame.IsUnfixed() { // if the frame is not fixed, return it as a victim
 				return frame, nil
 			}
 		}
@@ -69,16 +66,22 @@ func (c *ClockEvictionPolicy[I, O]) selectVictim(bf *Buffer[I, O]) (*Frame[I, O]
 // Buffer is a simple buffer pool implementation.
 // Uses FIX do UnFIX protocol to work with storage content.
 type Buffer[I DbObjectId, O any] struct {
-	frames         []*Frame[I, O]                  // buffer pages list
-	ht             *StaticHashFrameNodeTable[I, O] // static hash table for fast access to frames by id
-	emptyFrames    ConcurrentQueue[*Frame[I, O]]   // queue of empty frames
-	storageManager *StorageManager[I, O]           // used to store the pages in the persistent storage
-	sxLock         sync.RWMutex                    // lock to protect concurrent access to the buffer manager
-	evictionPolicy EvictionPolicy[I, O]            // eviction policy to select a victim frame
-	seed           maphash.Seed                    // hasher for computing hash index for the frames
+	frames           []*Frame[I, O]                  // buffer pages list
+	ht               *StaticHashFrameNodeTable[I, O] // static hash table for fast access to frames by id
+	emptyFrames      ConcurrentQueue[*Frame[I, O]]   // queue of empty frames
+	storageManager   *StorageManager[I, O]           // used to store the pages in the persistent storage
+	sxLock           sync.RWMutex                    // lock to protect concurrent access to the buffer manager
+	evictionPolicy   EvictionPolicy[I, O]            // eviction policy to select a victim frame
+	writeAheadLogger WriteAheadLogger                // write-ahead logging
+	seed             maphash.Seed                    // hasher for computing hash index for the frames
 }
 
-func NewBuffer[I DbObjectId, O any](size int, storageManager *StorageManager[I, O], emptyFramesQueue ConcurrentQueue[*Frame[I, O]]) *Buffer[I, O] {
+func NewBuffer[I DbObjectId, O any](
+	size int,
+	storageManager *StorageManager[I, O],
+	emptyFramesQueue ConcurrentQueue[*Frame[I, O]],
+	evictionPolicy EvictionPolicy[I, O],
+	writeAheadLogger WriteAheadLogger) *Buffer[I, O] {
 	b := &Buffer[I, O]{}
 	b.frames = make([]*Frame[I, O], 0, size)
 	b.ht = NewStaticHashFrameNodeTable[I, O](size) // initialize the static hash table
@@ -91,14 +94,17 @@ func NewBuffer[I DbObjectId, O any](size int, storageManager *StorageManager[I, 
 			dirty:     0,              // initially not dirty
 			frameRWmu: sync.RWMutex{}, // initialize the lock for the frame
 			index:     i,              // index will be set later
+			refBit:    atomic.Bool{},  // initialize the reference bit
+			lsn:       -1,             // initial log sequence number
 		}
 		b.frames = append(b.frames, p)
 	}
 	b.sxLock = sync.RWMutex{} // initialize the lock for the buffer manager
 	b.seed = maphash.MakeSeed()
 	b.storageManager = storageManager
-	b.evictionPolicy = NewClockEvictionPolicy[I, O](size) // initialize the eviction policy
+	b.evictionPolicy = evictionPolicy
 	b.emptyFrames = emptyFramesQueue
+	b.writeAheadLogger = writeAheadLogger
 	for _, page := range b.frames {
 		b.emptyFrames.Enqueue(page) // add all pages to the empty frames queue
 	}
@@ -115,6 +121,18 @@ func (bm *Buffer[I, O]) computeHash(id I) int {
 }
 
 func (bm *Buffer[I, O]) Fix(id I) (*Frame[I, O], error) {
+	return bm.fixFrame(id, Zero[O](), true)
+}
+
+// FixEmpty is used for new storage pages that not yet have data
+// this is an empty storage page with a no data
+// used to reserve a page in the storage manager
+func (bm *Buffer[I, O]) FixEmpty(id I, object O) (*Frame[I, O], error) {
+	return bm.fixFrame(id, object, false)
+}
+
+// helper function
+func (bm *Buffer[I, O]) fixFrame(id I, object O, fromStorage bool) (*Frame[I, O], error) {
 	// do not use the lock here instead we access ht table is  thread safe
 	// compute hash index for the id
 	hashIndex := bm.computeHash(id)
@@ -129,7 +147,8 @@ func (bm *Buffer[I, O]) Fix(id I) (*Frame[I, O], error) {
 		frameState := atomic.LoadInt32(&frameNode.loadState) // wait for the state to be set to 0
 		// return the Frame only if the state is 0
 		if frameState == 0 {
-			bm.evictionPolicy.register(frameNode.frame)
+			frameNode.frame.Fix()                       // increment the pin count
+			bm.evictionPolicy.Register(frameNode.frame) // register the frame in the eviction policy
 			return frameNode.frame, nil
 		}
 		// frame is not yet loaded
@@ -155,27 +174,23 @@ func (bm *Buffer[I, O]) Fix(id I) (*Frame[I, O], error) {
 			}
 			frame.Clear() // clear the frame for reuse
 			// now we can read the object from the storage manager
-			o, err := bm.storageManager.Read(id)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read object for id %v: %w", id, err)
+			if fromStorage {
+				o, err := bm.storageManager.Read(id)
+				if err != nil {
+					return nil, fmt.Errorf("failed to read object for id %v: %w", id, err)
+				}
+				frame.object = o
+			} else {
+				frame.object = object
 			}
 			frame.id = id
-			frame.object = o                           // load the object into the frame
-			frame.Fix()                                // increment the pin count
-			bm.evictionPolicy.register(frame)          // register the frame in the eviction policy
 			frameNode.frame = frame                    // update the frame in the hash table node
 			atomic.StoreInt32(&frameNode.loadState, 0) // set the state to 0
-			return frame, nil                          // return the frame with the object loaded
+			// FIXME we could short circuit here but for now lets not duplicate code
+			//return frame, nil                          // return the frame with the object loaded
 		}
 
 	}
-}
-
-// used for new storage pages that not yet have data
-// this is an empty storage page with a no data
-// used to reserve a page in the storage manager
-func (bm *Buffer[I, O]) FixEmpty(id I, object O) (*Frame[I, O], error) {
-	return nil, nil // placeholder for fix logic, if needed
 }
 
 func (bm *Buffer[I, O]) Unfix(frame *Frame[I, O]) error {
@@ -188,6 +203,11 @@ func (bm *Buffer[I, O]) Flush(frame *Frame[I, O]) error {
 	if frame.IsDirty() {
 		frame.frameRWmu.RLock()         // lock the frame for exclusive access
 		defer frame.frameRWmu.RUnlock() // unlock the frame after the operation
+		// write-ahead logging
+		if err := bm.writeAheadLogger.Flush(frame.lsn); err != nil {
+			return fmt.Errorf("failed to flush write-ahead log for frame %v: %w", frame.id, err)
+		}
+		// actual write
 		if err := bm.storageManager.Write(frame.id, frame.object); err != nil {
 			return fmt.Errorf("failed to flush frame %v: %w", frame.id, err)
 		}
@@ -231,22 +251,25 @@ func (bm *Buffer[I, O]) getEmptyFrame() (*Frame[I, O], error) {
 
 func (bm *Buffer[I, O]) getVictim() (*Frame[I, O], error) {
 	// default eviction policy is clock
-	return bm.evictionPolicy.selectVictim(bm) // use the eviction policy to select a victim frame
+	return bm.evictionPolicy.SelectVictim(bm) // use the eviction policy to select a victim frame
 }
 
 // Frame represents a single frame in the buffer manager.
 type Frame[I comparable, O any] struct {
 	object    O
-	fixCount  int32        // atomic counter
-	id        I            // id of the frame, used to identify the object in the storage
-	dirty     int32        // indicates if the frame is dirty (modified)
-	frameRWmu sync.RWMutex // to protect concurrent access to the frame
-	index     int          // index of the frame in the buffer manager
+	fixCount  int32             // atomic counter
+	id        I                 // id of the frame, used to identify the object in the storage
+	dirty     int32             // indicates if the frame is dirty (modified)
+	frameRWmu sync.RWMutex      // to protect concurrent access to the frame
+	index     int               // index of the frame in the buffer manager
+	refBit    atomic.Bool       // used by default clock policy on each fix method
+	lsn       LogSequenceNumber // log sequence number
 }
 
 func (f *Frame[I, O]) Fix() O {
 	// increment atomic
 	atomic.AddInt32(&(f.fixCount), 1) // increment the pin count
+	f.refBit.Store(true)              // set the reference bit
 	return f.object                   // return the object in the frame
 }
 
