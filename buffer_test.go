@@ -5,9 +5,24 @@ package paloo_db
 import (
 	"errors"
 	"fmt"
+	"iter"
 	"sync"
 	"testing"
 )
+
+type Dev0WriteAheadLogger struct{}
+
+func (d *Dev0WriteAheadLogger) Write(p []byte) (n int, err error) {
+	return len(p), nil
+}
+
+func (d *Dev0WriteAheadLogger) Flush(lsn LogSequenceNumber) error {
+	return nil
+}
+
+func (d *Dev0WriteAheadLogger) All() iter.Seq[[]byte] {
+	return func(yield func([]byte) bool) {}
+}
 
 type QueueType int
 
@@ -42,7 +57,7 @@ func preloadStorageWithIntsQueue(storageId string, bufferSize int, count int, qt
 		return pageId, nil
 	})
 	sm.Register(ms)
-	bm := NewBuffer(bufferSize, sm, getQueue(qt, bufferSize))
+	bm := NewBuffer(bufferSize, sm, getQueue(qt, bufferSize), NewClockEvictionPolicy[PageId, *int64](), &Dev0WriteAheadLogger{})
 	for i := range count {
 		pageId, err := ms.ReserveId()
 		if err != nil {
@@ -163,10 +178,8 @@ func TestBufferFixModifyUnfix(t *testing.T) {
 	for id, frame := range bm.frames {
 		obj := frame.object
 		t.Logf("Id  %v Frame %v %v", id, frame, *obj)
-	}
-	for idx, bitPtr := range bm.evictionPolicy.(*ClockEvictionPolicy[PageId, *int64]).framesBits {
-		va := bitPtr.Load()
-		t.Logf("Frame %d reference bit: %t", idx, va)
+		// print refBit
+		t.Logf("Frame %d reference bit: %t", id, frame.refBit.Load())
 	}
 	printHashTableContent(t, bm.ht)
 	// now fix pages that will flush modified content
@@ -184,9 +197,7 @@ func TestBufferFixModifyUnfix(t *testing.T) {
 	for id, frame := range bm.frames {
 		obj := frame.object
 		t.Logf("Id  %v Frame %v %v", id, frame, *obj)
-	}
-	for idx, bitPtr := range bm.evictionPolicy.(*ClockEvictionPolicy[PageId, *int64]).framesBits {
-		t.Logf("Frame %d reference bit: %t", idx, bitPtr.Load())
+		t.Logf("Frame %d reference bit: %t", id, frame.refBit.Load())
 	}
 	printHashTableContent(t, bm.ht)
 	// Verify that the content was modified and flushed
@@ -205,9 +216,7 @@ func TestBufferFixModifyUnfix(t *testing.T) {
 	for id, frame := range bm.frames {
 		obj := frame.object
 		t.Logf("Id  %v Frame %v %v", id, frame, *obj)
-	}
-	for idx, bitPtr := range bm.evictionPolicy.(*ClockEvictionPolicy[PageId, *int64]).framesBits {
-		t.Logf("Frame %d reference bit: %t", idx, bitPtr.Load())
+		t.Logf("Frame %d reference bit: %t", id, frame.refBit.Load())
 	}
 	printHashTableContent(t, bm.ht)
 }
