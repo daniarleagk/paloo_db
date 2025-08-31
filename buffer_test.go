@@ -59,7 +59,7 @@ func preloadStorageWithIntsQueue(storageId string, bufferSize int, count int, qt
 	sm.Register(ms)
 	bm := NewBuffer(bufferSize, sm, getQueue(qt, bufferSize), NewClockEvictionPolicy[PageId, *int64](), &Dev0WriteAheadLogger{})
 	for i := range count {
-		pageId, err := ms.ReserveId()
+		pageId, err := ms.Reserve()
 		if err != nil {
 			return nil, fmt.Errorf("Failed to reserve page ID: %v", err)
 		}
@@ -79,7 +79,7 @@ func printHashTableContent(t *testing.T, table *StaticHashFrameNodeTable[PageId,
 		if node != nil {
 			t.Logf("Index %v: %v", node.id, &node.frame)
 		} else {
-			t.Logf("Index %v: nil", node.id)
+			t.Logf("Index %v: nil", node)
 		}
 	}
 }

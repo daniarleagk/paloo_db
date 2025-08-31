@@ -3,8 +3,10 @@
 package paloo_db
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,7 +22,7 @@ type DbObjectId interface {
 // Storage represents block oriented storage interface
 type Storage[I comparable, O any] interface {
 	StorageId() string     // returns storage id
-	ReserveId() (I, error) // reserves a new id for the object
+	Reserve() (I, error)   // reserves a new id for the object
 	Read(id I) (O, error)  // read object by id
 	Write(id I, b O) error // write object by id
 	Delete(id I) error     // delete object by id
@@ -39,78 +41,6 @@ func NewPageId(storageId string, blockNr int64) PageId {
 
 func (p PageId) StorageId() string {
 	return p.storageId
-}
-
-// Block of records
-// records are fixed size
-// we use this block to store temp files for sorting
-type RecordsBlock struct {
-	data            []byte
-	maxByteCapacity uint32
-	numRecords      uint32
-	currentOffset   uint32
-	recordByteSize  uint32
-}
-
-// Default Constructor
-func NewRecordsBlock(maxByteCap uint32, recordByteSize uint32) *RecordsBlock {
-	return &RecordsBlock{
-		data:            make([]byte, maxByteCap),
-		numRecords:      0,
-		maxByteCapacity: maxByteCap,
-		recordByteSize:  recordByteSize,
-		currentOffset:   12, // first 12 bytes are reserved for numRecords, currentOffset and recordByteSize
-	}
-}
-
-// initializes block buffer with fixed byte capacity
-// first four bytes is reserved for numRecords
-func (rb *RecordsBlock) Init(maxByteCap uint32, recordByteSize uint32) {
-	rb.maxByteCapacity = maxByteCap
-	rb.recordByteSize = recordByteSize
-	rb.data = make([]byte, maxByteCap)
-	rb.numRecords = 0
-	rb.currentOffset = 12
-}
-
-// return ok  or error as bool if successfully appended
-func (rb *RecordsBlock) Append(data []byte) bool {
-	//no space
-	if rb.currentOffset+rb.recordByteSize > rb.maxByteCapacity {
-		return false
-	}
-	// copy
-	copy(rb.data[rb.currentOffset:], data)
-	rb.currentOffset += rb.recordByteSize
-	rb.numRecords++
-	return true
-}
-
-// returns data with first bytes the
-func (rb RecordsBlock) ToByteArray() []byte {
-	binary.BigEndian.PutUint32(rb.data[:4], rb.numRecords)
-	binary.BigEndian.PutUint32(rb.data[4:8], rb.currentOffset)
-	binary.BigEndian.PutUint32(rb.data[8:12], rb.recordByteSize)
-	return rb.data
-}
-
-func (rb *RecordsBlock) FromByteArray(d []byte) {
-	//TODO
-	rb.data = make([]byte, 0, rb.maxByteCapacity)
-	//
-}
-
-// ALL arrays stored in
-func (rb RecordsBlock) All() func(yield func([]byte) bool) {
-	return func(yield func([]byte) bool) {
-		offset := 12
-		for range int(rb.numRecords) {
-			if !yield(rb.data[offset : offset+int(rb.recordByteSize)]) {
-				break
-			}
-			offset += int(rb.recordByteSize)
-		}
-	}
 }
 
 // implementation of Page interface
@@ -233,15 +163,21 @@ func (s *SequenceBlockSingleFileStorage) StorageId() string {
 	return s.fileName
 }
 
-func (s *SequenceBlockSingleFileStorage) ReserveId() (PageId, error) {
+func (s *SequenceBlockSingleFileStorage) Reserve() (PageId, error) {
 	// reserve a new id for the object
+	// reserve by block appending zero content byte array will be added
 	s.rwMutex.Lock() // exclusive lock
 	defer s.rwMutex.Unlock()
 	curSize, err := s.getCurrentSize()
 	if err != nil {
-		return Zero[PageId](), fmt.Errorf("file not stat available %v", err)
+		return Zero[PageId](), fmt.Errorf("file stat not available %v", err)
 	}
 	blockNr := curSize / int64(s.blockSize)
+	// reserve block by writing
+	offset := curSize
+	if _, err := s.file.WriteAt(make([]byte, s.blockSize), offset); err != nil {
+		return Zero[PageId](), fmt.Errorf("write block error %v", err)
+	}
 	return PageId{storageId: s.fileName, blockNr: blockNr}, nil
 }
 
@@ -327,7 +263,7 @@ func (m *MapStorage[I, O]) Write(id I, b O) error {
 	return nil
 }
 
-func (m *MapStorage[I, O]) ReserveId() (I, error) {
+func (m *MapStorage[I, O]) Reserve() (I, error) {
 	m.rwMutex.Lock()
 	defer m.rwMutex.Unlock()
 	id, err := m.nextIdFunc()
@@ -352,4 +288,239 @@ func (m *MapStorage[I, O]) Close() error {
 	defer m.rwMutex.Unlock()
 	m.storage = make(map[I]O) // clear storage
 	return nil
+}
+
+// TempFileWriter interface for writing temporary files
+type TempFileWriter[T any] interface {
+	WriteSeq(recordSeq iter.Seq[T]) error
+	Flush() error
+	Close() error
+}
+
+// TempFileReader interface for reading temporary files
+type TempFileReader[T any] interface {
+	All() iter.Seq[T]
+	Close() error
+}
+
+// FixedSizeRecordBlock is a block of fixed-size records as internal storage helper.
+// used e.g. for tempfiles
+type FixedSizeRecordBlock struct {
+	data           []byte
+	blockSize      uint32
+	numRecords     uint32
+	currentOffset  uint32
+	recordByteSize uint32
+}
+
+// Default Constructor
+func NewFixedSizeRecordBlock(blockSize int, recordByteSize int32) *FixedSizeRecordBlock {
+	return &FixedSizeRecordBlock{
+		data:           make([]byte, blockSize),
+		numRecords:     0,
+		blockSize:      uint32(blockSize),
+		recordByteSize: uint32(recordByteSize),
+		currentOffset:  12, // first 12 bytes are reserved for numRecords, currentOffset and recordByteSize
+	}
+}
+
+// return ok  or error as bool if successfully appended
+func (rb *FixedSizeRecordBlock) Append(data []byte) bool {
+	//no space
+	if rb.currentOffset+rb.recordByteSize > rb.blockSize {
+		return false
+	}
+	// copy
+	copy(rb.data[rb.currentOffset:], data)
+	rb.currentOffset += rb.recordByteSize
+	rb.numRecords++
+	return true
+}
+
+// returns data with first bytes the
+func (rb FixedSizeRecordBlock) ToByteArray() []byte {
+	binary.BigEndian.PutUint32(rb.data[:4], rb.numRecords)
+	binary.BigEndian.PutUint32(rb.data[4:8], rb.currentOffset)
+	binary.BigEndian.PutUint32(rb.data[8:12], rb.recordByteSize)
+	return rb.data
+}
+
+func (rb *FixedSizeRecordBlock) FromByteArray(d []byte) {
+	rb.data = make([]byte, 0, rb.blockSize)
+	rb.numRecords = binary.BigEndian.Uint32(d[:4])
+	rb.currentOffset = binary.BigEndian.Uint32(d[4:8])
+	rb.recordByteSize = binary.BigEndian.Uint32(d[8:12])
+	copy(d[12:], rb.data)
+}
+
+func (rb FixedSizeRecordBlock) All() func(yield func([]byte) bool) {
+	return func(yield func([]byte) bool) {
+		offset := 12
+		for range int(rb.numRecords) {
+			if !yield(rb.data[offset : offset+int(rb.recordByteSize)]) {
+				break
+			}
+			offset += int(rb.recordByteSize)
+		}
+	}
+}
+
+func (rb *FixedSizeRecordBlock) Reset() error {
+	rb.numRecords = 0
+	rb.currentOffset = 12
+	return nil
+}
+
+func (rb *FixedSizeRecordBlock) String() string {
+	return fmt.Sprintf("FixedSizeRecordBlock{numRecords: %d, currentOffset: %d, recordByteSize: %d}",
+		rb.numRecords, rb.currentOffset, rb.recordByteSize)
+}
+
+// FixedSizeTempFileWriter simple wrapper temp file writer streamed and buffered
+type FixedSizeTempFileWriter[T any] struct {
+	file       *os.File
+	buffer     *bufio.Writer
+	bufferSize int
+	serialize  func(item T) ([]byte, error)
+}
+
+func NewFixedSizeTempFileWriter[T any](file *os.File, bufferSize int, serialize func(item T) ([]byte, error)) *FixedSizeTempFileWriter[T] {
+	return &FixedSizeTempFileWriter[T]{
+		file:       file,
+		buffer:     bufio.NewWriterSize(file, bufferSize),
+		bufferSize: bufferSize,
+		serialize:  serialize,
+	}
+}
+
+func (w *FixedSizeTempFileWriter[T]) Write(p []byte) (n int, err error) {
+	return w.buffer.Write(p)
+}
+
+func (w *FixedSizeTempFileWriter[T]) Flush() error {
+	// currently don´t use fsync
+	// FIXME for WAL writer
+	return w.buffer.Flush()
+}
+
+func (w *FixedSizeTempFileWriter[T]) Close() error {
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	return w.file.Close()
+}
+
+// TempFileReader simple wrapper temp file reader buffered
+type FixedSizeTempFileReader struct {
+	file       *os.File
+	buffer     *bufio.Reader
+	bufferSize int
+}
+
+func NewFixedSizeTempFileReader(file *os.File, bufferSize int) *FixedSizeTempFileReader {
+	return &FixedSizeTempFileReader{
+		file:       file,
+		buffer:     bufio.NewReaderSize(file, bufferSize),
+		bufferSize: bufferSize,
+	}
+}
+
+func (r *FixedSizeTempFileReader) Read(p []byte) (n int, err error) {
+	return r.buffer.Read(p)
+}
+
+func (r *FixedSizeTempFileReader) Close() error {
+	return r.file.Close()
+}
+
+type Sorter[T any] struct {
+	comparatorFunc    func(a, b T) int
+	getByteSize       func(item T) int
+	serialize         func(item T) ([]byte, error) //
+	deserialize       func(data []byte) (T, error)
+	directoryPath     string
+	filePrefix        string
+	fileExtension     string
+	currentMergeRound int
+	readBufferSize    int
+	writeBufferSize   int
+	kWayMergeSize     int // number of files that would be merged in each round
+}
+
+func (s *Sorter[T]) Sort(input iter.Seq[T]) (iter.Seq[T], error) {
+	if input == nil {
+		return nil, fmt.Errorf("input iterator is nil")
+	}
+
+	// Implement sorting logic here
+	// For now, we'll just return the input as-is
+	return input, nil
+}
+
+func (s *Sorter[T]) GenerateRuns(input iter.Seq[T]) (iter.Seq[T], error) {
+	if input == nil {
+		return nil, fmt.Errorf("input iterator is nil")
+	}
+
+	// Implement run generation logic here
+	// For now, we'll just return the input as-is
+	return input, nil
+}
+
+func (s *Sorter[T]) Close() error {
+	// Implement any necessary cleanup logic here
+	// removes all files in the directory with the same prefix
+	return nil
+}
+
+type RunGenerator[T any] struct {
+	comparatorFunc  func(a, b T) int
+	getByteSize     func(item T) int
+	serialize       func(item T) ([]byte, error) //
+	deserialize     func(data []byte) (T, error)
+	maxRunSize      int // in bytes
+	directoryPath   string
+	filePrefix      string
+	fileExtension   string
+	writeBufferSize int
+	sliceBuffer     []T
+}
+
+func (g *RunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
+	if input == nil {
+		return fmt.Errorf("input iterator is nil")
+	}
+	currentSizeBytes := 0
+	for t := range input {
+		byteSize := g.getByteSize(t)
+		addedSize := currentSizeBytes + byteSize
+		if addedSize > g.maxRunSize {
+			// sort and flush
+			// reset slice buffer
+			g.sliceBuffer = nil
+		}
+		if g.sliceBuffer == nil {
+			g.sliceBuffer = make([]T, 0, g.maxRunSize/byteSize)
+		}
+		g.sliceBuffer = append(g.sliceBuffer, t)
+
+	}
+	// Implement run generation logic here
+	// For now, we'll just return the input as-is
+	return nil
+}
+
+type KWayMerger[T any] struct {
+	comparatorFunc  func(a, b T) int
+	directoryPath   string
+	filePrefix      string
+	fileExtension   string
+	readBufferSize  int
+	writeBufferSize int
+	kWayMergeSize   int
+}
+
+func (m *KWayMerger[T]) MergeRuns() (iter.Seq[T], error) {
+	// Implement merging logic here
+	return nil, nil
 }
