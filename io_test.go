@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -14,6 +15,70 @@ import (
 	"sync"
 	"testing"
 )
+
+// for testing purposes
+type MapStorage[I DbObjectId, O any] struct {
+	storage    map[I]O // map of pages by id
+	storageId  string  // storage identifier
+	rwMutex    sync.RWMutex
+	nextIdFunc func() (I, error)
+}
+
+func NewMapStorage[I DbObjectId, O any](storageId string, nextIdFunc func() (I, error)) *MapStorage[I, O] {
+	return &MapStorage[I, O]{
+		storage:    make(map[I]O),
+		rwMutex:    sync.RWMutex{},
+		nextIdFunc: nextIdFunc, // start with id 0
+		storageId:  storageId,
+	}
+}
+
+func (m *MapStorage[I, O]) StorageId() string {
+	return m.storageId
+}
+
+func (m *MapStorage[I, O]) Read(id I) (O, error) {
+	m.rwMutex.RLock()
+	defer m.rwMutex.RUnlock()
+	if pPage, exists := m.storage[id]; exists {
+		return pPage, nil
+	}
+	return Zero[O](), fmt.Errorf("page with id %v not found", id)
+}
+
+func (m *MapStorage[I, O]) Write(id I, b O) error {
+	m.rwMutex.Lock()
+	defer m.rwMutex.Unlock()
+	m.storage[id] = b
+	return nil
+}
+
+func (m *MapStorage[I, O]) Reserve() (I, error) {
+	m.rwMutex.Lock()
+	defer m.rwMutex.Unlock()
+	id, err := m.nextIdFunc()
+	if err != nil {
+		return Zero[I](), fmt.Errorf("failed to reserve id: %v", err)
+	}
+	return id, nil
+}
+
+func (m *MapStorage[I, O]) Delete(id I) error {
+	m.rwMutex.Lock()
+	defer m.rwMutex.Unlock()
+	if _, exists := m.storage[id]; !exists {
+		return fmt.Errorf("page with id %v not found", id)
+	}
+	delete(m.storage, id)
+	return nil
+}
+
+func (m *MapStorage[I, O]) Close() error {
+	m.rwMutex.Lock()
+	defer m.rwMutex.Unlock()
+	m.storage = make(map[I]O) // clear storage
+	return nil
+}
 
 type StorageConfig struct {
 	directory   string
@@ -232,5 +297,75 @@ func TestFixedSizeRecordBlock(t *testing.T) {
 		}
 		t.Logf("Read record %d: %v", i, record)
 		i++
+	}
+}
+
+func TestFixedSizeRecordWriterReader(t *testing.T) {
+	tmpDir := t.TempDir()
+	fp := filepath.Join(tmpDir, "test.tmp")
+	f, err := os.OpenFile(fp, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("cannot open file %s: %v", fp, err)
+	}
+	defer f.Close()
+	// Create a FixedSizeTempFileWriter
+	serialize := func(item int32) ([]byte, error) {
+		buf := new(bytes.Buffer)
+		if err := binary.Write(buf, binary.BigEndian, item); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+	// NOTE the header per buffer is 12 bytes
+	// current capacity is 64 - 12 = 52
+	// each record is 4 bytes
+	// we should have 13 Records per buffer
+	recordsPerBuffer := 13
+	writer := NewFixedSizeTempFileWriter(f, 64, 4, serialize)
+	// now we will insert 4 buffers
+	// 3 full buffers and 1 partial buffer
+	// each buffer can hold 13 records
+	maxRecords := recordsPerBuffer*3 + 2
+	slice := make([]int32, 0, maxRecords)
+	for i := range maxRecords {
+		slice = append(slice, int32(i))
+	}
+	// Write all records
+	if err := writer.WriteSeq(slices.Values(slice)); err != nil {
+		t.Errorf("write batch failed: %v", err)
+	}
+	// Flush the writer
+	if err := writer.Flush(); err != nil {
+		t.Errorf("flush failed: %v", err)
+	}
+	deserialize := func(data []byte) (int32, error) {
+		var record int32
+		buf := bytes.NewReader(data)
+		if err := binary.Read(buf, binary.BigEndian, &record); err != nil {
+			return 0, err
+		}
+		return record, nil
+	}
+	// reset offset from a file handler
+	f.Seek(0, io.SeekStart)
+	// Create a FixedSizeTempFileReader
+	reader := NewFixedSizeTempFileReader(f, 64, 4, deserialize)
+	// Read all records
+	allRecords := reader.All()
+	i := 0
+	shouldHaveData := false
+	for r := range allRecords {
+		if r.Error != nil {
+			t.Errorf("read failed: %v", r.Error)
+		}
+		if r.Record != int32(i) {
+			t.Errorf("expected record %d got %d", i, r.Record)
+		}
+		t.Logf("Read record %d: %v", i, r.Record)
+		i++
+		shouldHaveData = true
+	}
+	if !shouldHaveData {
+		t.Errorf("expected data but got none")
 	}
 }

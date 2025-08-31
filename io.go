@@ -3,9 +3,10 @@
 package paloo_db
 
 import (
-	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"os"
 	"path/filepath"
@@ -226,68 +227,10 @@ func (s *SequenceBlockSingleFileStorage) Close() error {
 	return nil
 }
 
-// for testing purposes
-type MapStorage[I DbObjectId, O any] struct {
-	storage    map[I]O // map of pages by id
-	storageId  string  // storage identifier
-	rwMutex    sync.RWMutex
-	nextIdFunc func() (I, error)
-}
-
-func NewMapStorage[I DbObjectId, O any](storageId string, nextIdFunc func() (I, error)) *MapStorage[I, O] {
-	return &MapStorage[I, O]{
-		storage:    make(map[I]O),
-		rwMutex:    sync.RWMutex{},
-		nextIdFunc: nextIdFunc, // start with id 0
-		storageId:  storageId,
-	}
-}
-
-func (m *MapStorage[I, O]) StorageId() string {
-	return m.storageId
-}
-
-func (m *MapStorage[I, O]) Read(id I) (O, error) {
-	m.rwMutex.RLock()
-	defer m.rwMutex.RUnlock()
-	if pPage, exists := m.storage[id]; exists {
-		return pPage, nil
-	}
-	return Zero[O](), fmt.Errorf("page with id %v not found", id)
-}
-
-func (m *MapStorage[I, O]) Write(id I, b O) error {
-	m.rwMutex.Lock()
-	defer m.rwMutex.Unlock()
-	m.storage[id] = b
-	return nil
-}
-
-func (m *MapStorage[I, O]) Reserve() (I, error) {
-	m.rwMutex.Lock()
-	defer m.rwMutex.Unlock()
-	id, err := m.nextIdFunc()
-	if err != nil {
-		return Zero[I](), fmt.Errorf("failed to reserve id: %v", err)
-	}
-	return id, nil
-}
-
-func (m *MapStorage[I, O]) Delete(id I) error {
-	m.rwMutex.Lock()
-	defer m.rwMutex.Unlock()
-	if _, exists := m.storage[id]; !exists {
-		return fmt.Errorf("page with id %v not found", id)
-	}
-	delete(m.storage, id)
-	return nil
-}
-
-func (m *MapStorage[I, O]) Close() error {
-	m.rwMutex.Lock()
-	defer m.rwMutex.Unlock()
-	m.storage = make(map[I]O) // clear storage
-	return nil
+// RecordWithError wraps a record with an error
+type RecordWithError[T any] struct {
+	Record T
+	Error  error
 }
 
 // TempFileWriter interface for writing temporary files
@@ -299,12 +242,120 @@ type TempFileWriter[T any] interface {
 
 // TempFileReader interface for reading temporary files
 type TempFileReader[T any] interface {
-	All() iter.Seq[T]
+	All() iter.Seq[RecordWithError[T]]
 	Close() error
 }
 
+// FixedSizeTempFileWriter simple wrapper temp file writer streamed and buffered
+// assumption is that record fits into block/buffer
+// FIXME do we really need a buffered writer
+// FIXME we could also think about using a direct write approach
+// FIXME maybe also consider double buffer and go routine to flush
+type FixedSizeTempFileWriter[T any] struct {
+	file        *os.File
+	bufferSize  int
+	serialize   func(item T) ([]byte, error)
+	bufferBlock FixedSizeRecordBlock
+	recordSize  int
+}
+
+func NewFixedSizeTempFileWriter[T any](file *os.File, bufferSize int, recordSize int, serialize func(item T) ([]byte, error)) *FixedSizeTempFileWriter[T] {
+	return &FixedSizeTempFileWriter[T]{
+		file:        file,
+		bufferSize:  bufferSize,
+		serialize:   serialize,
+		bufferBlock: *NewFixedSizeRecordBlock(bufferSize, recordSize),
+		recordSize:  recordSize,
+	}
+}
+
+func (w *FixedSizeTempFileWriter[T]) WriteSeq(recordSeq iter.Seq[T]) error {
+	for record := range recordSeq {
+		data, err := w.serialize(record)
+		if err != nil {
+			return err
+		}
+		ok := w.bufferBlock.Append(data)
+		if !ok {
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			w.bufferBlock.Reset()
+			w.bufferBlock.Append(data)
+		}
+	}
+	return nil
+}
+
+func (w *FixedSizeTempFileWriter[T]) Flush() error {
+	// currently don´t use fsync
+	// FIXME for WAL writer
+	_, err := w.file.Write(w.bufferBlock.ToByteArray())
+	return err
+}
+
+func (w *FixedSizeTempFileWriter[T]) Close() error {
+	// flush remaining data
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	return w.file.Close()
+}
+
+// TempFileReader simple wrapper temp file reader buffered
+type FixedSizeTempFileReader[T any] struct {
+	file        *os.File
+	deserialize func(data []byte) (T, error)
+	bufferSize  int
+	bufferBlock FixedSizeRecordBlock
+	recordSize  int
+}
+
+func NewFixedSizeTempFileReader[T any](file *os.File, bufferSize int, recordSize int, deserialize func(data []byte) (T, error)) *FixedSizeTempFileReader[T] {
+	return &FixedSizeTempFileReader[T]{
+		file:        file,
+		bufferSize:  bufferSize,
+		bufferBlock: *NewFixedSizeRecordBlock(bufferSize, recordSize),
+		recordSize:  recordSize,
+		deserialize: deserialize,
+	}
+}
+
+func (r *FixedSizeTempFileReader[T]) All() iter.Seq[RecordWithError[T]] {
+	f := func(yield func(RecordWithError[T]) bool) {
+	outerLoop:
+		for {
+			_, err := r.file.Read(r.bufferBlock.data) // initial read
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				yield(RecordWithError[T]{Error: err})
+				break
+			}
+			r.bufferBlock.Bootstrap()
+			for bSlice := range r.bufferBlock.All() {
+				record, err := r.deserialize(bSlice)
+				if err != nil {
+					yield(RecordWithError[T]{Error: err})
+					break outerLoop
+				}
+				if !yield(RecordWithError[T]{Record: record, Error: nil}) {
+					break outerLoop
+				}
+			}
+			r.bufferBlock.Reset()
+		}
+	}
+	return f
+}
+
+func (r *FixedSizeTempFileReader[T]) Close() error {
+	return r.file.Close()
+}
+
 // FixedSizeRecordBlock is a block of fixed-size records as internal storage helper.
-// used e.g. for tempfiles
+// used e.g. for tempfiles while sorting
 type FixedSizeRecordBlock struct {
 	data           []byte
 	blockSize      uint32
@@ -314,7 +365,7 @@ type FixedSizeRecordBlock struct {
 }
 
 // Default Constructor
-func NewFixedSizeRecordBlock(blockSize int, recordByteSize int32) *FixedSizeRecordBlock {
+func NewFixedSizeRecordBlock(blockSize int, recordByteSize int) *FixedSizeRecordBlock {
 	return &FixedSizeRecordBlock{
 		data:           make([]byte, blockSize),
 		numRecords:     0,
@@ -353,6 +404,13 @@ func (rb *FixedSizeRecordBlock) FromByteArray(d []byte) {
 	copy(d[12:], rb.data)
 }
 
+// Bootstrap initializes the block with values from its internal data array
+func (rb *FixedSizeRecordBlock) Bootstrap() {
+	rb.numRecords = binary.BigEndian.Uint32(rb.data[:4])
+	rb.currentOffset = binary.BigEndian.Uint32(rb.data[4:8])
+	rb.recordByteSize = binary.BigEndian.Uint32(rb.data[8:12])
+}
+
 func (rb FixedSizeRecordBlock) All() func(yield func([]byte) bool) {
 	return func(yield func([]byte) bool) {
 		offset := 12
@@ -374,153 +432,4 @@ func (rb *FixedSizeRecordBlock) Reset() error {
 func (rb *FixedSizeRecordBlock) String() string {
 	return fmt.Sprintf("FixedSizeRecordBlock{numRecords: %d, currentOffset: %d, recordByteSize: %d}",
 		rb.numRecords, rb.currentOffset, rb.recordByteSize)
-}
-
-// FixedSizeTempFileWriter simple wrapper temp file writer streamed and buffered
-type FixedSizeTempFileWriter[T any] struct {
-	file       *os.File
-	buffer     *bufio.Writer
-	bufferSize int
-	serialize  func(item T) ([]byte, error)
-}
-
-func NewFixedSizeTempFileWriter[T any](file *os.File, bufferSize int, serialize func(item T) ([]byte, error)) *FixedSizeTempFileWriter[T] {
-	return &FixedSizeTempFileWriter[T]{
-		file:       file,
-		buffer:     bufio.NewWriterSize(file, bufferSize),
-		bufferSize: bufferSize,
-		serialize:  serialize,
-	}
-}
-
-func (w *FixedSizeTempFileWriter[T]) Write(p []byte) (n int, err error) {
-	return w.buffer.Write(p)
-}
-
-func (w *FixedSizeTempFileWriter[T]) Flush() error {
-	// currently don´t use fsync
-	// FIXME for WAL writer
-	return w.buffer.Flush()
-}
-
-func (w *FixedSizeTempFileWriter[T]) Close() error {
-	if err := w.Flush(); err != nil {
-		return err
-	}
-	return w.file.Close()
-}
-
-// TempFileReader simple wrapper temp file reader buffered
-type FixedSizeTempFileReader struct {
-	file       *os.File
-	buffer     *bufio.Reader
-	bufferSize int
-}
-
-func NewFixedSizeTempFileReader(file *os.File, bufferSize int) *FixedSizeTempFileReader {
-	return &FixedSizeTempFileReader{
-		file:       file,
-		buffer:     bufio.NewReaderSize(file, bufferSize),
-		bufferSize: bufferSize,
-	}
-}
-
-func (r *FixedSizeTempFileReader) Read(p []byte) (n int, err error) {
-	return r.buffer.Read(p)
-}
-
-func (r *FixedSizeTempFileReader) Close() error {
-	return r.file.Close()
-}
-
-type Sorter[T any] struct {
-	comparatorFunc    func(a, b T) int
-	getByteSize       func(item T) int
-	serialize         func(item T) ([]byte, error) //
-	deserialize       func(data []byte) (T, error)
-	directoryPath     string
-	filePrefix        string
-	fileExtension     string
-	currentMergeRound int
-	readBufferSize    int
-	writeBufferSize   int
-	kWayMergeSize     int // number of files that would be merged in each round
-}
-
-func (s *Sorter[T]) Sort(input iter.Seq[T]) (iter.Seq[T], error) {
-	if input == nil {
-		return nil, fmt.Errorf("input iterator is nil")
-	}
-
-	// Implement sorting logic here
-	// For now, we'll just return the input as-is
-	return input, nil
-}
-
-func (s *Sorter[T]) GenerateRuns(input iter.Seq[T]) (iter.Seq[T], error) {
-	if input == nil {
-		return nil, fmt.Errorf("input iterator is nil")
-	}
-
-	// Implement run generation logic here
-	// For now, we'll just return the input as-is
-	return input, nil
-}
-
-func (s *Sorter[T]) Close() error {
-	// Implement any necessary cleanup logic here
-	// removes all files in the directory with the same prefix
-	return nil
-}
-
-type RunGenerator[T any] struct {
-	comparatorFunc  func(a, b T) int
-	getByteSize     func(item T) int
-	serialize       func(item T) ([]byte, error) //
-	deserialize     func(data []byte) (T, error)
-	maxRunSize      int // in bytes
-	directoryPath   string
-	filePrefix      string
-	fileExtension   string
-	writeBufferSize int
-	sliceBuffer     []T
-}
-
-func (g *RunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
-	if input == nil {
-		return fmt.Errorf("input iterator is nil")
-	}
-	currentSizeBytes := 0
-	for t := range input {
-		byteSize := g.getByteSize(t)
-		addedSize := currentSizeBytes + byteSize
-		if addedSize > g.maxRunSize {
-			// sort and flush
-			// reset slice buffer
-			g.sliceBuffer = nil
-		}
-		if g.sliceBuffer == nil {
-			g.sliceBuffer = make([]T, 0, g.maxRunSize/byteSize)
-		}
-		g.sliceBuffer = append(g.sliceBuffer, t)
-
-	}
-	// Implement run generation logic here
-	// For now, we'll just return the input as-is
-	return nil
-}
-
-type KWayMerger[T any] struct {
-	comparatorFunc  func(a, b T) int
-	directoryPath   string
-	filePrefix      string
-	fileExtension   string
-	readBufferSize  int
-	writeBufferSize int
-	kWayMergeSize   int
-}
-
-func (m *KWayMerger[T]) MergeRuns() (iter.Seq[T], error) {
-	// Implement merging logic here
-	return nil, nil
 }
