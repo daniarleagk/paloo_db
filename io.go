@@ -4,7 +4,10 @@ package paloo_db
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
+	"iter"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,7 +23,7 @@ type DbObjectId interface {
 // Storage represents block oriented storage interface
 type Storage[I comparable, O any] interface {
 	StorageId() string     // returns storage id
-	ReserveId() (I, error) // reserves a new id for the object
+	Reserve() (I, error)   // reserves a new id for the object
 	Read(id I) (O, error)  // read object by id
 	Write(id I, b O) error // write object by id
 	Delete(id I) error     // delete object by id
@@ -39,78 +42,6 @@ func NewPageId(storageId string, blockNr int64) PageId {
 
 func (p PageId) StorageId() string {
 	return p.storageId
-}
-
-// Block of records
-// records are fixed size
-// we use this block to store temp files for sorting
-type RecordsBlock struct {
-	data            []byte
-	maxByteCapacity uint32
-	numRecords      uint32
-	currentOffset   uint32
-	recordByteSize  uint32
-}
-
-// Default Constructor
-func NewRecordsBlock(maxByteCap uint32, recordByteSize uint32) *RecordsBlock {
-	return &RecordsBlock{
-		data:            make([]byte, maxByteCap),
-		numRecords:      0,
-		maxByteCapacity: maxByteCap,
-		recordByteSize:  recordByteSize,
-		currentOffset:   12, // first 12 bytes are reserved for numRecords, currentOffset and recordByteSize
-	}
-}
-
-// initializes block buffer with fixed byte capacity
-// first four bytes is reserved for numRecords
-func (rb *RecordsBlock) Init(maxByteCap uint32, recordByteSize uint32) {
-	rb.maxByteCapacity = maxByteCap
-	rb.recordByteSize = recordByteSize
-	rb.data = make([]byte, maxByteCap)
-	rb.numRecords = 0
-	rb.currentOffset = 12
-}
-
-// return ok  or error as bool if successfully appended
-func (rb *RecordsBlock) Append(data []byte) bool {
-	//no space
-	if rb.currentOffset+rb.recordByteSize > rb.maxByteCapacity {
-		return false
-	}
-	// copy
-	copy(rb.data[rb.currentOffset:], data)
-	rb.currentOffset += rb.recordByteSize
-	rb.numRecords++
-	return true
-}
-
-// returns data with first bytes the
-func (rb RecordsBlock) ToByteArray() []byte {
-	binary.BigEndian.PutUint32(rb.data[:4], rb.numRecords)
-	binary.BigEndian.PutUint32(rb.data[4:8], rb.currentOffset)
-	binary.BigEndian.PutUint32(rb.data[8:12], rb.recordByteSize)
-	return rb.data
-}
-
-func (rb *RecordsBlock) FromByteArray(d []byte) {
-	//TODO
-	rb.data = make([]byte, 0, rb.maxByteCapacity)
-	//
-}
-
-// ALL arrays stored in
-func (rb RecordsBlock) All() func(yield func([]byte) bool) {
-	return func(yield func([]byte) bool) {
-		offset := 12
-		for range int(rb.numRecords) {
-			if !yield(rb.data[offset : offset+int(rb.recordByteSize)]) {
-				break
-			}
-			offset += int(rb.recordByteSize)
-		}
-	}
 }
 
 // implementation of Page interface
@@ -233,15 +164,21 @@ func (s *SequenceBlockSingleFileStorage) StorageId() string {
 	return s.fileName
 }
 
-func (s *SequenceBlockSingleFileStorage) ReserveId() (PageId, error) {
+func (s *SequenceBlockSingleFileStorage) Reserve() (PageId, error) {
 	// reserve a new id for the object
+	// reserve by block appending zero content byte array will be added
 	s.rwMutex.Lock() // exclusive lock
 	defer s.rwMutex.Unlock()
 	curSize, err := s.getCurrentSize()
 	if err != nil {
-		return Zero[PageId](), fmt.Errorf("file not stat available %v", err)
+		return Zero[PageId](), fmt.Errorf("file stat not available %v", err)
 	}
 	blockNr := curSize / int64(s.blockSize)
+	// reserve block by writing
+	offset := curSize
+	if _, err := s.file.WriteAt(make([]byte, s.blockSize), offset); err != nil {
+		return Zero[PageId](), fmt.Errorf("write block error %v", err)
+	}
 	return PageId{storageId: s.fileName, blockNr: blockNr}, nil
 }
 
@@ -290,66 +227,209 @@ func (s *SequenceBlockSingleFileStorage) Close() error {
 	return nil
 }
 
-// for testing purposes
-type MapStorage[I DbObjectId, O any] struct {
-	storage    map[I]O // map of pages by id
-	storageId  string  // storage identifier
-	rwMutex    sync.RWMutex
-	nextIdFunc func() (I, error)
+// RecordWithError wraps a record with an error
+type RecordWithError[T any] struct {
+	Record T
+	Error  error
 }
 
-func NewMapStorage[I DbObjectId, O any](storageId string, nextIdFunc func() (I, error)) *MapStorage[I, O] {
-	return &MapStorage[I, O]{
-		storage:    make(map[I]O),
-		rwMutex:    sync.RWMutex{},
-		nextIdFunc: nextIdFunc, // start with id 0
-		storageId:  storageId,
+// TempFileWriter interface for writing temporary files
+type TempFileWriter[T any] interface {
+	WriteSeq(recordSeq iter.Seq[T]) error
+	Flush() error
+	Close() error
+}
+
+// TempFileReader interface for reading temporary files
+type TempFileReader[T any] interface {
+	All() iter.Seq[RecordWithError[T]]
+	Close() error
+}
+
+// FixedSizeTempFileWriter simple wrapper temp file writer streamed and buffered
+// assumption is that record fits into block/buffer
+// FIXME do we really need a buffered writer
+// FIXME we could also think about using a direct write approach
+// FIXME maybe also consider double buffer and go routine to flush
+type FixedSizeTempFileWriter[T any] struct {
+	file        *os.File
+	bufferSize  int
+	serialize   func(item T) ([]byte, error)
+	bufferBlock FixedSizeRecordBlock
+	recordSize  int
+}
+
+func NewFixedSizeTempFileWriter[T any](file *os.File, bufferSize int, recordSize int, serialize func(item T) ([]byte, error)) *FixedSizeTempFileWriter[T] {
+	return &FixedSizeTempFileWriter[T]{
+		file:        file,
+		bufferSize:  bufferSize,
+		serialize:   serialize,
+		bufferBlock: *NewFixedSizeRecordBlock(bufferSize, recordSize),
+		recordSize:  recordSize,
 	}
 }
 
-func (m *MapStorage[I, O]) StorageId() string {
-	return m.storageId
-}
-
-func (m *MapStorage[I, O]) Read(id I) (O, error) {
-	m.rwMutex.RLock()
-	defer m.rwMutex.RUnlock()
-	if pPage, exists := m.storage[id]; exists {
-		return pPage, nil
+func (w *FixedSizeTempFileWriter[T]) WriteSeq(recordSeq iter.Seq[T]) error {
+	for record := range recordSeq {
+		data, err := w.serialize(record)
+		if err != nil {
+			return err
+		}
+		ok := w.bufferBlock.Append(data)
+		if !ok {
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			w.bufferBlock.Reset()
+			w.bufferBlock.Append(data)
+		}
 	}
-	return Zero[O](), fmt.Errorf("page with id %v not found", id)
-}
-
-func (m *MapStorage[I, O]) Write(id I, b O) error {
-	m.rwMutex.Lock()
-	defer m.rwMutex.Unlock()
-	m.storage[id] = b
 	return nil
 }
 
-func (m *MapStorage[I, O]) ReserveId() (I, error) {
-	m.rwMutex.Lock()
-	defer m.rwMutex.Unlock()
-	id, err := m.nextIdFunc()
-	if err != nil {
-		return Zero[I](), fmt.Errorf("failed to reserve id: %v", err)
-	}
-	return id, nil
+func (w *FixedSizeTempFileWriter[T]) Flush() error {
+	// currently don´t use fsync
+	// FIXME for WAL writer
+	_, err := w.file.Write(w.bufferBlock.ToByteArray())
+	return err
 }
 
-func (m *MapStorage[I, O]) Delete(id I) error {
-	m.rwMutex.Lock()
-	defer m.rwMutex.Unlock()
-	if _, exists := m.storage[id]; !exists {
-		return fmt.Errorf("page with id %v not found", id)
+func (w *FixedSizeTempFileWriter[T]) Close() error {
+	// flush remaining data
+	if err := w.Flush(); err != nil {
+		return err
 	}
-	delete(m.storage, id)
+	return w.file.Close()
+}
+
+// TempFileReader simple wrapper temp file reader buffered
+type FixedSizeTempFileReader[T any] struct {
+	file        *os.File
+	deserialize func(data []byte) (T, error)
+	bufferSize  int
+	bufferBlock FixedSizeRecordBlock
+	recordSize  int
+}
+
+func NewFixedSizeTempFileReader[T any](file *os.File, bufferSize int, recordSize int, deserialize func(data []byte) (T, error)) *FixedSizeTempFileReader[T] {
+	return &FixedSizeTempFileReader[T]{
+		file:        file,
+		bufferSize:  bufferSize,
+		bufferBlock: *NewFixedSizeRecordBlock(bufferSize, recordSize),
+		recordSize:  recordSize,
+		deserialize: deserialize,
+	}
+}
+
+func (r *FixedSizeTempFileReader[T]) All() iter.Seq[RecordWithError[T]] {
+	f := func(yield func(RecordWithError[T]) bool) {
+	outerLoop:
+		for {
+			_, err := r.file.Read(r.bufferBlock.data) // initial read
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				yield(RecordWithError[T]{Error: err})
+				break
+			}
+			r.bufferBlock.Bootstrap()
+			for bSlice := range r.bufferBlock.All() {
+				record, err := r.deserialize(bSlice)
+				if err != nil {
+					yield(RecordWithError[T]{Error: err})
+					break outerLoop
+				}
+				if !yield(RecordWithError[T]{Record: record, Error: nil}) {
+					break outerLoop
+				}
+			}
+			r.bufferBlock.Reset()
+		}
+	}
+	return f
+}
+
+func (r *FixedSizeTempFileReader[T]) Close() error {
+	return r.file.Close()
+}
+
+// FixedSizeRecordBlock is a block of fixed-size records as internal storage helper.
+// used e.g. for tempfiles while sorting
+type FixedSizeRecordBlock struct {
+	data           []byte
+	blockSize      uint32
+	numRecords     uint32
+	currentOffset  uint32
+	recordByteSize uint32
+}
+
+// Default Constructor
+func NewFixedSizeRecordBlock(blockSize int, recordByteSize int) *FixedSizeRecordBlock {
+	return &FixedSizeRecordBlock{
+		data:           make([]byte, blockSize),
+		numRecords:     0,
+		blockSize:      uint32(blockSize),
+		recordByteSize: uint32(recordByteSize),
+		currentOffset:  12, // first 12 bytes are reserved for numRecords, currentOffset and recordByteSize
+	}
+}
+
+// return ok  or error as bool if successfully appended
+func (rb *FixedSizeRecordBlock) Append(data []byte) bool {
+	//no space
+	if rb.currentOffset+rb.recordByteSize > rb.blockSize {
+		return false
+	}
+	// copy
+	copy(rb.data[rb.currentOffset:], data)
+	rb.currentOffset += rb.recordByteSize
+	rb.numRecords++
+	return true
+}
+
+// returns data with first bytes the
+func (rb FixedSizeRecordBlock) ToByteArray() []byte {
+	binary.BigEndian.PutUint32(rb.data[:4], rb.numRecords)
+	binary.BigEndian.PutUint32(rb.data[4:8], rb.currentOffset)
+	binary.BigEndian.PutUint32(rb.data[8:12], rb.recordByteSize)
+	return rb.data
+}
+
+func (rb *FixedSizeRecordBlock) FromByteArray(d []byte) {
+	rb.data = make([]byte, 0, rb.blockSize)
+	rb.numRecords = binary.BigEndian.Uint32(d[:4])
+	rb.currentOffset = binary.BigEndian.Uint32(d[4:8])
+	rb.recordByteSize = binary.BigEndian.Uint32(d[8:12])
+	copy(d[12:], rb.data)
+}
+
+// Bootstrap initializes the block with values from its internal data array
+func (rb *FixedSizeRecordBlock) Bootstrap() {
+	rb.numRecords = binary.BigEndian.Uint32(rb.data[:4])
+	rb.currentOffset = binary.BigEndian.Uint32(rb.data[4:8])
+	rb.recordByteSize = binary.BigEndian.Uint32(rb.data[8:12])
+}
+
+func (rb FixedSizeRecordBlock) All() func(yield func([]byte) bool) {
+	return func(yield func([]byte) bool) {
+		offset := 12
+		for range int(rb.numRecords) {
+			if !yield(rb.data[offset : offset+int(rb.recordByteSize)]) {
+				break
+			}
+			offset += int(rb.recordByteSize)
+		}
+	}
+}
+
+func (rb *FixedSizeRecordBlock) Reset() error {
+	rb.numRecords = 0
+	rb.currentOffset = 12
 	return nil
 }
 
-func (m *MapStorage[I, O]) Close() error {
-	m.rwMutex.Lock()
-	defer m.rwMutex.Unlock()
-	m.storage = make(map[I]O) // clear storage
-	return nil
+func (rb *FixedSizeRecordBlock) String() string {
+	return fmt.Sprintf("FixedSizeRecordBlock{numRecords: %d, currentOffset: %d, recordByteSize: %d}",
+		rb.numRecords, rb.currentOffset, rb.recordByteSize)
 }
