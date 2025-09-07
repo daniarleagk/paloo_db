@@ -78,7 +78,7 @@ func (s *Sorter[T]) Close() error {
 	return nil
 }
 
-type StandardGoSortRunGenerator[T any] struct {
+type GoSortRunGenerator[T any] struct {
 	comparatorFunc        func(a, b T) int
 	getByteSize           func(item T) int
 	serialize             func(item T) ([]byte, error)
@@ -93,7 +93,7 @@ type StandardGoSortRunGenerator[T any] struct {
 	parallelism           int
 }
 
-func NewStandardGoSortRunGenerator[T any](
+func NewGoSortRunGenerator[T any](
 	comparatorFunc func(a, b T) int,
 	getByteSize func(item T) int,
 	serialize func(item T) ([]byte, error),
@@ -105,8 +105,8 @@ func NewStandardGoSortRunGenerator[T any](
 	fileExtension string,
 	tempFileWriterFactory CreateTempFileWriterFactory[T],
 	parallelism int,
-) *StandardGoSortRunGenerator[T] {
-	runGen := &StandardGoSortRunGenerator[T]{
+) *GoSortRunGenerator[T] {
+	runGen := &GoSortRunGenerator[T]{
 		comparatorFunc:        comparatorFunc,
 		getByteSize:           getByteSize,
 		serialize:             serialize,
@@ -123,7 +123,7 @@ func NewStandardGoSortRunGenerator[T any](
 	return runGen
 }
 
-func (g *StandardGoSortRunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
+func (g *GoSortRunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
 	if input == nil {
 		return fmt.Errorf("input iterator is nil")
 	}
@@ -137,7 +137,7 @@ func (g *StandardGoSortRunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
 			if err := g.sortAndFlush(currentRunIndex); err != nil {
 				return fmt.Errorf("failed to sort and flush: %v", err)
 			}
-			currentSizeBytes = byteSize
+			currentSizeBytes = 0
 			currentRunIndex++
 			// reset the slice buffer
 			g.sliceBuffer = nil
@@ -146,6 +146,7 @@ func (g *StandardGoSortRunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
 			g.sliceBuffer = make([]T, 0, g.initialRunSize)
 		}
 		g.sliceBuffer = append(g.sliceBuffer, t)
+		currentSizeBytes += byteSize
 	}
 	// flush the remaining items
 	if len(g.sliceBuffer) > 0 {
@@ -156,7 +157,7 @@ func (g *StandardGoSortRunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
 	return nil
 }
 
-func (g *StandardGoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
+func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	// sort the sliceBuffer using the comparatorFunc
 	// write the sorted data to a temporary file using the tempFileWriterFactory
 	// current length of the sliceBuffer
@@ -164,7 +165,7 @@ func (g *StandardGoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error 
 	errorsChan := make(chan error, g.parallelism)
 	defer close(errorsChan)
 	chunkSize := (len(g.sliceBuffer) + g.parallelism - 1) / g.parallelism
-	for i := range g.parallelism {
+	for i := 0; i < g.parallelism; i++ {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
@@ -175,7 +176,13 @@ func (g *StandardGoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error 
 				return
 			}
 			defer tmpFile.Close()
-			part := g.sliceBuffer[i*chunkSize : (i+1)*chunkSize]
+			start := i * chunkSize
+			if start >= len(g.sliceBuffer) {
+				// no more data to process
+				return
+			}
+			end := min((i+1)*chunkSize, len(g.sliceBuffer))
+			part := g.sliceBuffer[start:end]
 			// Sort the chunk
 			slices.SortFunc(part, g.comparatorFunc)
 			// Write the sorted chunk to the temporary file
@@ -197,7 +204,7 @@ func (g *StandardGoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error 
 	return nil
 }
 
-func (g *StandardGoSortRunGenerator[T]) createTmpFile(currentRunIndex int, index int) (*os.File, error) {
+func (g *GoSortRunGenerator[T]) createTmpFile(currentRunIndex int, index int) (*os.File, error) {
 	fileName := fmt.Sprintf("%s/%s_run_%06d_%03d.%s", g.directoryPath, g.filePrefix, currentRunIndex, index, g.fileExtension)
 	return os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
 }
