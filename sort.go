@@ -9,6 +9,7 @@ package paloo_db
 // e.g. multi-threaded, single-threaded, replacement-selection, radix,... etc.
 
 import (
+	"container/heap"
 	"fmt"
 	"iter"
 	"os"
@@ -222,4 +223,86 @@ type KWayMerger[T any] struct {
 func (m *KWayMerger[T]) Merge() (iter.Seq[T], error) {
 	// Implement merging logic here
 	return nil, nil
+}
+
+func (m *KWayMerger[T]) MergeSeq(sequences []iter.Seq[T]) (iter.Seq[T], error) {
+	// create heap
+	heapCompare := func(a, b PullIterRecordPair[T]) int {
+		return m.comparatorFunc(a.record, b.record)
+	}
+	mergeHeap := &MergeHeap[PullIterRecordPair[T]]{
+		items:   []PullIterRecordPair[T]{},
+		compare: heapCompare,
+	}
+	heap.Init(mergeHeap)
+
+	// Implement merging logic here
+	for _, s := range sequences {
+		// pull the first item from each sequence
+		next, stop := iter.Pull(s)
+		r, ok := next()
+		if !ok {
+			continue
+		}
+		pair := PullIterRecordPair[T]{record: r, next: next, stop: stop}
+		heap.Push(mergeHeap, pair)
+	}
+	// repeatedly pull the smallest item from the heap and push the next item from the same sequence
+	// until all sequences are exhausted
+	// return an iterator that yields the merged items
+	return func(yield func(T) bool) {
+		for mergeHeap.Len() > 0 {
+			// pull the smallest item from the heap
+			item := heap.Pop(mergeHeap).(PullIterRecordPair[T])
+			// yield the item
+			if !yield(item.record) {
+				return
+			}
+			// push the next item from the same sequence
+			next, stop := item.next, item.stop
+			if r, ok := next(); ok {
+				pair := PullIterRecordPair[T]{record: r, next: next, stop: stop}
+				heap.Push(mergeHeap, pair)
+			} else {
+				stop()
+			}
+		}
+	}, nil
+}
+
+type PullIterRecordPair[T any] struct {
+	record T
+	next   func() (T, bool)
+	stop   func()
+}
+
+// MergeHeap is a min-heap used for merging sorted sequences.
+// uses standard library container/heap interface
+type MergeHeap[T any] struct {
+	items   []T
+	compare func(a, b T) int
+}
+
+func (h *MergeHeap[T]) Len() int {
+	return len(h.items)
+}
+
+func (h *MergeHeap[T]) Less(i, j int) bool {
+	return h.compare(h.items[i], h.items[j]) < 0
+}
+
+func (h *MergeHeap[T]) Swap(i, j int) {
+	h.items[i], h.items[j] = h.items[j], h.items[i]
+}
+
+func (h *MergeHeap[T]) Push(x any) {
+	h.items = append(h.items, x.(T))
+}
+
+func (h *MergeHeap[T]) Pop() any {
+	old := h.items
+	n := len(old)
+	x := old[n-1]
+	h.items = old[0 : n-1]
+	return x
 }
