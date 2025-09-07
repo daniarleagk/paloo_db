@@ -284,6 +284,13 @@ func (w *FixedSizeTempFileWriter[T]) WriteSeq(recordSeq iter.Seq[T]) error {
 			w.bufferBlock.Append(data)
 		}
 	}
+	// flush remaining data
+	if w.bufferBlock.numRecords > 0 {
+		if err := w.Flush(); err != nil {
+			return err
+		}
+		w.bufferBlock.Reset()
+	}
 	return nil
 }
 
