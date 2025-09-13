@@ -5,6 +5,7 @@ package paloo_db
 import (
 	"bytes"
 	"encoding/binary"
+	"iter"
 	"math/rand"
 	"os"
 	"slices"
@@ -129,3 +130,60 @@ func TestGoSortRunGenerator(t *testing.T) {
 
 // TODO More tests  e.g. error handling and edge cases
 // also different configurations e.g. parallelism, run size, buffer size etc.
+
+func Map[T any, U any](input iter.Seq[T], mapFunc func(T) U) iter.Seq[U] {
+	return func(yield func(U) bool) {
+		for item := range input {
+			if !yield(mapFunc(item)) {
+				break
+			}
+		}
+	}
+}
+
+func TestKWayMerger(t *testing.T) {
+	k := 5
+	sequences := make([]iter.Seq[RecordWithError[int32]], 0)
+	allCount := 0
+	slice := make([]int32, 0)
+	numElements := 53
+	for i := range numElements {
+		slice = append(slice, int32(i))
+		allCount++
+	}
+	chunkSize := (numElements + k - 1) / k
+	for i := range k {
+		start := i * chunkSize
+		end := min(start+chunkSize, numElements)
+		if start >= end {
+			continue
+		}
+		subSlice := slice[start:end]
+		t.Log("Sequence", i, "from", start, "to", end, "size", len(subSlice), "contents:", subSlice)
+		mappedIt := Map(slices.Values(subSlice), func(v int32) RecordWithError[int32] {
+			return RecordWithError[int32]{Record: v, Error: nil}
+		})
+		sequences = append(sequences, mappedIt)
+	}
+	t.Logf("Merging %d sequences", len(sequences))
+	merger := NewKWayMerger(func(a, b int32) int {
+		return int(a - b)
+	})
+	mergedSeq, err := merger.MergeSeq(sequences)
+	if err != nil {
+		t.Fatalf("failed to merge sequences: %v", err)
+	}
+	previous := int32(-1)
+	count := 0
+	for r := range mergedSeq {
+		if r < previous {
+			t.Errorf("expected %d, but got %d", previous, r)
+		}
+		//t.Log("sorted record", r)
+		previous = r
+		count++
+	}
+	if count != allCount {
+		t.Errorf("expected to read %d records, but got %d", allCount, count)
+	}
+}

@@ -22,7 +22,7 @@ type RunGenerator[T any] interface {
 }
 
 type Merger[T any] interface {
-	Merge() (iter.Seq[T], error)
+	MergeSeq(sequences []iter.Seq[RecordWithError[T]]) (iter.Seq[T], error)
 }
 
 type CreateTempFileWriterFactory[T any] interface {
@@ -162,6 +162,8 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	// sort the sliceBuffer using the comparatorFunc
 	// write the sorted data to a temporary file using the tempFileWriterFactory
 	// current length of the sliceBuffer
+	// current plan not to use errgroup
+	// change in the future if needed
 	var wg sync.WaitGroup
 	errorsChan := make(chan error, g.parallelism)
 	defer close(errorsChan)
@@ -194,7 +196,6 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 			}
 		}(i)
 	}
-	//TODO: implement in case of errors early return
 	wg.Wait()
 	// Check for any errors
 	select {
@@ -211,21 +212,14 @@ func (g *GoSortRunGenerator[T]) createTmpFile(currentRunIndex int, index int) (*
 }
 
 type KWayMerger[T any] struct {
-	comparatorFunc  func(a, b T) int
-	directoryPath   string
-	filePrefix      string
-	fileExtension   string
-	readBufferSize  int
-	writeBufferSize int
-	kWayMergeSize   int
+	comparatorFunc func(a, b T) int
 }
 
-func (m *KWayMerger[T]) Merge() (iter.Seq[T], error) {
-	// Implement merging logic here
-	return nil, nil
+func NewKWayMerger[T any](comparatorFunc func(a, b T) int) *KWayMerger[T] {
+	return &KWayMerger[T]{comparatorFunc: comparatorFunc}
 }
 
-func (m *KWayMerger[T]) MergeSeq(sequences []iter.Seq[T]) (iter.Seq[T], error) {
+func (m *KWayMerger[T]) MergeSeq(sequences []iter.Seq[RecordWithError[T]]) (iter.Seq[T], error) {
 	// create heap
 	heapCompare := func(a, b PullIterRecordPair[T]) int {
 		return m.comparatorFunc(a.record, b.record)
@@ -244,7 +238,10 @@ func (m *KWayMerger[T]) MergeSeq(sequences []iter.Seq[T]) (iter.Seq[T], error) {
 		if !ok {
 			continue
 		}
-		pair := PullIterRecordPair[T]{record: r, next: next, stop: stop}
+		if r.Error != nil {
+			return nil, r.Error
+		}
+		pair := PullIterRecordPair[T]{record: r.Record, next: next, stop: stop}
 		heap.Push(mergeHeap, pair)
 	}
 	// repeatedly pull the smallest item from the heap and push the next item from the same sequence
@@ -261,7 +258,12 @@ func (m *KWayMerger[T]) MergeSeq(sequences []iter.Seq[T]) (iter.Seq[T], error) {
 			// push the next item from the same sequence
 			next, stop := item.next, item.stop
 			if r, ok := next(); ok {
-				pair := PullIterRecordPair[T]{record: r, next: next, stop: stop}
+				if r.Error != nil {
+					// stop the iteration on error
+					stop()
+					return
+				}
+				pair := PullIterRecordPair[T]{record: r.Record, next: next, stop: stop}
 				heap.Push(mergeHeap, pair)
 			} else {
 				stop()
@@ -270,9 +272,10 @@ func (m *KWayMerger[T]) MergeSeq(sequences []iter.Seq[T]) (iter.Seq[T], error) {
 	}, nil
 }
 
+// PullIterRecordPair is a helper struct to hold the current record and the next function of an iterator
 type PullIterRecordPair[T any] struct {
 	record T
-	next   func() (T, bool)
+	next   func() (RecordWithError[T], bool)
 	stop   func()
 }
 
