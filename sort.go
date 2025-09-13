@@ -9,6 +9,7 @@ package paloo_db
 // e.g. multi-threaded, single-threaded, replacement-selection, radix,... etc.
 
 import (
+	"container/heap"
 	"fmt"
 	"iter"
 	"os"
@@ -21,7 +22,7 @@ type RunGenerator[T any] interface {
 }
 
 type Merger[T any] interface {
-	Merge() (iter.Seq[T], error)
+	MergeSeq(sequences []iter.Seq[RecordWithError[T]]) (iter.Seq[T], error)
 }
 
 type CreateTempFileWriterFactory[T any] interface {
@@ -161,6 +162,8 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	// sort the sliceBuffer using the comparatorFunc
 	// write the sorted data to a temporary file using the tempFileWriterFactory
 	// current length of the sliceBuffer
+	// current plan not to use errgroup
+	// change in the future if needed
 	var wg sync.WaitGroup
 	errorsChan := make(chan error, g.parallelism)
 	defer close(errorsChan)
@@ -193,7 +196,6 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 			}
 		}(i)
 	}
-	//TODO: implement in case of errors early return
 	wg.Wait()
 	// Check for any errors
 	select {
@@ -210,16 +212,100 @@ func (g *GoSortRunGenerator[T]) createTmpFile(currentRunIndex int, index int) (*
 }
 
 type KWayMerger[T any] struct {
-	comparatorFunc  func(a, b T) int
-	directoryPath   string
-	filePrefix      string
-	fileExtension   string
-	readBufferSize  int
-	writeBufferSize int
-	kWayMergeSize   int
+	comparatorFunc func(a, b T) int
 }
 
-func (m *KWayMerger[T]) Merge() (iter.Seq[T], error) {
+func NewKWayMerger[T any](comparatorFunc func(a, b T) int) *KWayMerger[T] {
+	return &KWayMerger[T]{comparatorFunc: comparatorFunc}
+}
+
+func (m *KWayMerger[T]) MergeSeq(sequences []iter.Seq[RecordWithError[T]]) (iter.Seq[T], error) {
+	// create heap
+	heapCompare := func(a, b PullIterRecordPair[T]) int {
+		return m.comparatorFunc(a.record, b.record)
+	}
+	mergeHeap := &MergeHeap[PullIterRecordPair[T]]{
+		items:   []PullIterRecordPair[T]{},
+		compare: heapCompare,
+	}
+	heap.Init(mergeHeap)
+
 	// Implement merging logic here
-	return nil, nil
+	for _, s := range sequences {
+		// pull the first item from each sequence
+		next, stop := iter.Pull(s)
+		r, ok := next()
+		if !ok {
+			continue
+		}
+		if r.Error != nil {
+			return nil, r.Error
+		}
+		pair := PullIterRecordPair[T]{record: r.Record, next: next, stop: stop}
+		heap.Push(mergeHeap, pair)
+	}
+	// repeatedly pull the smallest item from the heap and push the next item from the same sequence
+	// until all sequences are exhausted
+	// return an iterator that yields the merged items
+	return func(yield func(T) bool) {
+		for mergeHeap.Len() > 0 {
+			// pull the smallest item from the heap
+			item := heap.Pop(mergeHeap).(PullIterRecordPair[T])
+			// yield the item
+			if !yield(item.record) {
+				return
+			}
+			// push the next item from the same sequence
+			next, stop := item.next, item.stop
+			if r, ok := next(); ok {
+				if r.Error != nil {
+					// stop the iteration on error
+					stop()
+					return
+				}
+				pair := PullIterRecordPair[T]{record: r.Record, next: next, stop: stop}
+				heap.Push(mergeHeap, pair)
+			} else {
+				stop()
+			}
+		}
+	}, nil
+}
+
+// PullIterRecordPair is a helper struct to hold the current record and the next function of an iterator
+type PullIterRecordPair[T any] struct {
+	record T
+	next   func() (RecordWithError[T], bool)
+	stop   func()
+}
+
+// MergeHeap is a min-heap used for merging sorted sequences.
+// uses standard library container/heap interface
+type MergeHeap[T any] struct {
+	items   []T
+	compare func(a, b T) int
+}
+
+func (h *MergeHeap[T]) Len() int {
+	return len(h.items)
+}
+
+func (h *MergeHeap[T]) Less(i, j int) bool {
+	return h.compare(h.items[i], h.items[j]) < 0
+}
+
+func (h *MergeHeap[T]) Swap(i, j int) {
+	h.items[i], h.items[j] = h.items[j], h.items[i]
+}
+
+func (h *MergeHeap[T]) Push(x any) {
+	h.items = append(h.items, x.(T))
+}
+
+func (h *MergeHeap[T]) Pop() any {
+	old := h.items
+	n := len(old)
+	x := old[n-1]
+	h.items = old[0 : n-1]
+	return x
 }
