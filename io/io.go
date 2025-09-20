@@ -1,6 +1,6 @@
 // Copyright (c) 2025 Daniar Achakeev
 // This source code is licensed under the MIT license found in the LICENSE.txt file in the root directory
-package paloo_db
+package io
 
 import (
 	"encoding/binary"
@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/daniarleagk/paloo_db/utils"
 )
 
 const TempFileSuffix string = "tmp"
@@ -114,7 +116,7 @@ func (sm *StorageManager[I, O]) Read(id I) (O, error) {
 	if storage, exists := sm.storages[id.StorageId()]; exists {
 		return storage.Read(id)
 	}
-	return Zero[O](), fmt.Errorf("storage with id %s not found", id.StorageId())
+	return utils.Zero[O](), fmt.Errorf("storage with id %s not found", id.StorageId())
 }
 
 // write block
@@ -171,13 +173,13 @@ func (s *SequenceBlockSingleFileStorage) Reserve() (PageId, error) {
 	defer s.rwMutex.Unlock()
 	curSize, err := s.getCurrentSize()
 	if err != nil {
-		return Zero[PageId](), fmt.Errorf("file stat not available %v", err)
+		return utils.Zero[PageId](), fmt.Errorf("file stat not available %v", err)
 	}
 	blockNr := curSize / int64(s.blockSize)
 	// reserve block by writing
 	offset := curSize
 	if _, err := s.file.WriteAt(make([]byte, s.blockSize), offset); err != nil {
-		return Zero[PageId](), fmt.Errorf("write block error %v", err)
+		return utils.Zero[PageId](), fmt.Errorf("write block error %v", err)
 	}
 	return PageId{storageId: s.fileName, blockNr: blockNr}, nil
 }

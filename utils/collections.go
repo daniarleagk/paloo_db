@@ -1,4 +1,4 @@
-package paloo_db
+package utils
 
 // This file provides custom collection implementations.
 import (

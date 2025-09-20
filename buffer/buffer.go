@@ -1,7 +1,7 @@
 // Copyright (c) 2025 Daniar Achakeev
 // This source code is licensed under the MIT license found in the LICENSE.txt file in the root directory
 
-package paloo_db
+package buffer
 
 import (
 	"errors"
@@ -11,25 +11,29 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/daniarleagk/paloo_db/io"
+	"github.com/daniarleagk/paloo_db/utils"
+	"github.com/daniarleagk/paloo_db/wal"
 )
 
-var ErrNoEmptyOrEvicted = errors.New("paloo_db: no empty or evicted frames available")
-var ErrFrameHashTableError = errors.New("paloo_db: frame not found in hash table")
+var ErrNoEmptyOrEvicted = errors.New("buffer: no empty or evicted frames available")
+var ErrFrameHashTableError = errors.New("buffer: frame not found in hash table")
 
 // EvictionPolicy is interface for buffer eviction policy.
-type EvictionPolicy[I DbObjectId, O any] interface {
+type EvictionPolicy[I io.DbObjectId, O any] interface {
 	Register(frame *Frame[I, O])                         // register
 	SelectVictim(bf *Buffer[I, O]) (*Frame[I, O], error) // select a victim page to evict
 }
 
 // ClockEvictionPolicy is a basic clock eviction policy.
-type ClockEvictionPolicy[I DbObjectId, O any] struct {
+type ClockEvictionPolicy[I io.DbObjectId, O any] struct {
 	clockPointer atomic.Int32
 	maxLoops     int // max loops for checking reference
 	//  bits if after two check still no false bit found take the next unfixed frame at most with one additional loop
 }
 
-func NewClockEvictionPolicy[I DbObjectId, O any]() *ClockEvictionPolicy[I, O] {
+func NewClockEvictionPolicy[I io.DbObjectId, O any]() *ClockEvictionPolicy[I, O] {
 	return &ClockEvictionPolicy[I, O]{
 		clockPointer: atomic.Int32{}, // initialize the clock pointer to 0
 		maxLoops:     2,
@@ -65,37 +69,37 @@ func (c *ClockEvictionPolicy[I, O]) SelectVictim(bf *Buffer[I, O]) (*Frame[I, O]
 
 // Buffer is a simple buffer pool implementation.
 // Uses FIX do UnFIX protocol to work with storage content.
-type Buffer[I DbObjectId, O any] struct {
-	frames           []*Frame[I, O]                  // buffer pages list
-	ht               *StaticHashFrameNodeTable[I, O] // static hash table for fast access to frames by id
-	emptyFrames      ConcurrentQueue[*Frame[I, O]]   // queue of empty frames
-	storageManager   *StorageManager[I, O]           // used to store the pages in the persistent storage
-	sxLock           sync.RWMutex                    // lock to protect concurrent access to the buffer manager
-	evictionPolicy   EvictionPolicy[I, O]            // eviction policy to select a victim frame
-	writeAheadLogger WriteAheadLogger                // write-ahead logging
-	seed             maphash.Seed                    // hasher for computing hash index for the frames
+type Buffer[I io.DbObjectId, O any] struct {
+	frames           []*Frame[I, O]                      // buffer pages list
+	ht               *StaticHashFrameNodeTable[I, O]     // static hash table for fast access to frames by id
+	emptyFrames      utils.ConcurrentQueue[*Frame[I, O]] // queue of empty frames
+	storageManager   *io.StorageManager[I, O]            // used to store the pages in the persistent storage
+	sxLock           sync.RWMutex                        // lock to protect concurrent access to the buffer manager
+	evictionPolicy   EvictionPolicy[I, O]                // eviction policy to select a victim frame
+	writeAheadLogger wal.WriteAheadLogger                // write-ahead logging
+	seed             maphash.Seed                        // hasher for computing hash index for the frames
 }
 
-func NewBuffer[I DbObjectId, O any](
+func NewBuffer[I io.DbObjectId, O any](
 	size int,
-	storageManager *StorageManager[I, O],
-	emptyFramesQueue ConcurrentQueue[*Frame[I, O]],
+	storageManager *io.StorageManager[I, O],
+	emptyFramesQueue utils.ConcurrentQueue[*Frame[I, O]],
 	evictionPolicy EvictionPolicy[I, O],
-	writeAheadLogger WriteAheadLogger) *Buffer[I, O] {
+	writeAheadLogger wal.WriteAheadLogger) *Buffer[I, O] {
 	b := &Buffer[I, O]{}
 	b.frames = make([]*Frame[I, O], 0, size)
 	b.ht = NewStaticHashFrameNodeTable[I, O](size) // initialize the static hash table
 	// initializes empty pages
 	for i := range size {
 		p := &Frame[I, O]{
-			id:        Zero[I](),      // assuming I is a pointer type
-			object:    Zero[O](),      // assuming O is a pointer type
-			fixCount:  0,              // initially not fixed
-			dirty:     0,              // initially not dirty
-			frameRWmu: sync.RWMutex{}, // initialize the lock for the frame
-			index:     i,              // index will be set later
-			refBit:    atomic.Bool{},  // initialize the reference bit
-			lsn:       -1,             // initial log sequence number
+			id:        utils.Zero[I](), // assuming I is a pointer type
+			object:    utils.Zero[O](), // assuming O is a pointer type
+			fixCount:  0,               // initially not fixed
+			dirty:     0,               // initially not dirty
+			frameRWmu: sync.RWMutex{},  // initialize the lock for the frame
+			index:     i,               // index will be set later
+			refBit:    atomic.Bool{},   // initialize the reference bit
+			lsn:       -1,              // initial log sequence number
 		}
 		b.frames = append(b.frames, p)
 	}
@@ -121,7 +125,7 @@ func (bm *Buffer[I, O]) computeHash(id I) int {
 }
 
 func (bm *Buffer[I, O]) Fix(id I) (*Frame[I, O], error) {
-	return bm.fixFrame(id, Zero[O](), true)
+	return bm.fixFrame(id, utils.Zero[O](), true)
 }
 
 // FixEmpty is used for new storage pages that not yet have data
@@ -257,13 +261,13 @@ func (bm *Buffer[I, O]) getVictim() (*Frame[I, O], error) {
 // Frame represents a single frame in the buffer manager.
 type Frame[I comparable, O any] struct {
 	object    O
-	fixCount  int32             // atomic counter
-	id        I                 // id of the frame, used to identify the object in the storage
-	dirty     int32             // indicates if the frame is dirty (modified)
-	frameRWmu sync.RWMutex      // to protect concurrent access to the frame
-	index     int               // index of the frame in the buffer manager
-	refBit    atomic.Bool       // used by default clock policy on each fix method
-	lsn       LogSequenceNumber // log sequence number
+	fixCount  int32                 // atomic counter
+	id        I                     // id of the frame, used to identify the object in the storage
+	dirty     int32                 // indicates if the frame is dirty (modified)
+	frameRWmu sync.RWMutex          // to protect concurrent access to the frame
+	index     int                   // index of the frame in the buffer manager
+	refBit    atomic.Bool           // used by default clock policy on each fix method
+	lsn       wal.LogSequenceNumber // log sequence number
 }
 
 func (f *Frame[I, O]) Fix() O {
@@ -300,8 +304,8 @@ func (f *Frame[I, O]) IsDirty() bool {
 }
 
 func (f *Frame[I, O]) Clear() {
-	f.id = Zero[I]()     // reset the id to zero value
-	f.object = Zero[O]() // reset the object to zero value
+	f.id = utils.Zero[I]()     // reset the id to zero value
+	f.object = utils.Zero[O]() // reset the object to zero value
 	// set atomic
 	// write 0 atomically
 	atomic.StoreInt32(&(f.fixCount), 0) // reset the pin count
@@ -309,7 +313,7 @@ func (f *Frame[I, O]) Clear() {
 }
 
 func (f *Frame[I, O]) IsEmpty() bool {
-	return atomic.LoadInt32(&(f.fixCount)) == 0 && atomic.LoadInt32(&(f.dirty)) == 0 && f.id == Zero[I]()
+	return atomic.LoadInt32(&(f.fixCount)) == 0 && atomic.LoadInt32(&(f.dirty)) == 0 && f.id == utils.Zero[I]()
 }
 
 func (f *Frame[I, O]) String() string {
@@ -347,7 +351,7 @@ func NewStaticHashFrameNodeTable[I comparable, O any](size int) *StaticHashFrame
 		lock:  sync.RWMutex{},
 	}
 	for i := range size {
-		ht.nodes[i] = &FrameNode[I, O]{id: Zero[I](), frame: nil, bucketIndex: i, isAnchor: true, next: nil}
+		ht.nodes[i] = &FrameNode[I, O]{id: utils.Zero[I](), frame: nil, bucketIndex: i, isAnchor: true, next: nil}
 	}
 	return ht
 }

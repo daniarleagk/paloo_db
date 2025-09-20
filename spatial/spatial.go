@@ -1,11 +1,13 @@
 // Copyright (c) 2025 Daniar Achakeev
 // This source code is licensed under the MIT license found in the LICENSE.txt file in the root directory.
-package paloo_db
+package spatial
 
 import (
 	"encoding/binary"
 	"errors"
 	"math"
+
+	"github.com/daniarleagk/paloo_db/utils"
 )
 
 type DoublePointRectangle struct {
@@ -14,7 +16,7 @@ type DoublePointRectangle struct {
 	upRight   []float64
 }
 
-func getDoublePointRectangleDeSerFunc() DeSerFunc[DoublePointRectangle] {
+func getDoublePointRectangleDeSerFunc() utils.DeSerFunc[DoublePointRectangle] {
 	return func(data []byte) (st DoublePointRectangle, err error) {
 		// read the dimension
 		// slice first 2 bytes
@@ -45,7 +47,7 @@ func getDoublePointRectangleDeSerFunc() DeSerFunc[DoublePointRectangle] {
 	}
 }
 
-func getDoublePointRectangleSerFunc() SerFunc[DoublePointRectangle] {
+func getDoublePointRectangleSerFunc() utils.SerFunc[DoublePointRectangle] {
 	return func(s DoublePointRectangle, data []byte) (n int, err error) {
 		// length and capacity of the slice is 2 + 2 * dimension * 8
 		capacity := 2 + 2*int(s.dimension)*8

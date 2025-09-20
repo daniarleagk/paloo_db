@@ -1,23 +1,26 @@
 //go:build !race
 
-package paloo_db
+package operators
 
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"iter"
 	"math/rand"
 	"os"
 	"slices"
 	"testing"
+
+	"github.com/daniarleagk/paloo_db/io"
 )
 
 type FixedSizeTempFileWriterFactory[T any] struct {
 	recordSize int
 }
 
-func (f *FixedSizeTempFileWriterFactory[T]) CreateTempFileWriter(file *os.File, bufferSize int, serialize func(item T) ([]byte, error)) TempFileWriter[T] {
-	return NewFixedSizeTempFileWriter(file, bufferSize, f.recordSize, serialize)
+func (f *FixedSizeTempFileWriterFactory[T]) CreateTempFileWriter(file *os.File, bufferSize int, serialize func(item T) ([]byte, error)) io.TempFileWriter[T] {
+	return io.NewFixedSizeTempFileWriter(file, bufferSize, f.recordSize, serialize)
 }
 
 func permutate(slice []int32) []int32 {
@@ -58,19 +61,17 @@ func TestGoSortRunGenerator(t *testing.T) {
 	getByteSize := func(item int32) int {
 		return 4 // size of int32
 	}
-	runGenerator := NewGoSortRunGenerator(
-		comparator,
-		getByteSize,
-		serialize,
+	runGenerator := NewGoSortRunGenerator[int32](
 		readWriteBufferSize, // buffer size
 		runSizeByteMemory,   // run size
 		128/4,               // initial run size
-		directory,
-		"sort",
-		"tmp",
-		&FixedSizeTempFileWriterFactory[int32]{recordSize: 4},
-		parallelism, // parallelism
+		parallelism,         // parallelism
 	)
+	createTmpFile := func(currentRunIndex int, index int) (*os.File, error) {
+		fileName := fmt.Sprintf("%s/%s_run_%06d_%03d.%s", directory, "sort", currentRunIndex, index, "tmp")
+		return os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
+	}
+	runGenerator.Initialize(comparator, getByteSize, serialize, createTmpFile, &FixedSizeTempFileWriterFactory[int32]{recordSize: 4})
 	err := runGenerator.GenerateRuns(slices.Values(int32Slice))
 	if err != nil {
 		t.Fatalf("failed to generate runs: %v", err)
@@ -107,7 +108,7 @@ func TestGoSortRunGenerator(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to open file %s: %v", file, err)
 		}
-		reader := NewFixedSizeTempFileReader(f, 64, 4, deserialize)
+		reader := io.NewFixedSizeTempFileReader(f, 64, 4, deserialize)
 		t.Logf("Reading file: %s", file)
 		previous := int32(-1)
 		for r := range reader.All() { // just to ensure we can read all records
@@ -143,7 +144,7 @@ func Map[T any, U any](input iter.Seq[T], mapFunc func(T) U) iter.Seq[U] {
 
 func TestKWayMerger(t *testing.T) {
 	k := 5
-	sequences := make([]iter.Seq[RecordWithError[int32]], 0)
+	sequences := make([]iter.Seq[io.RecordWithError[int32]], 0)
 	allCount := 0
 	slice := make([]int32, 0)
 	numElements := 53
@@ -160,16 +161,15 @@ func TestKWayMerger(t *testing.T) {
 		}
 		subSlice := slice[start:end]
 		t.Log("Sequence", i, "from", start, "to", end, "size", len(subSlice), "contents:", subSlice)
-		mappedIt := Map(slices.Values(subSlice), func(v int32) RecordWithError[int32] {
-			return RecordWithError[int32]{Record: v, Error: nil}
+		mappedIt := Map(slices.Values(subSlice), func(v int32) io.RecordWithError[int32] {
+			return io.RecordWithError[int32]{Record: v, Error: nil}
 		})
 		sequences = append(sequences, mappedIt)
 	}
 	t.Logf("Merging %d sequences", len(sequences))
-	merger := NewKWayMerger(func(a, b int32) int {
+	mergedSeq, err := MergeHeapFunc(sequences, func(a, b int32) int {
 		return int(a - b)
 	})
-	mergedSeq, err := merger.MergeSeq(sequences)
 	if err != nil {
 		t.Fatalf("failed to merge sequences: %v", err)
 	}

@@ -1,8 +1,10 @@
-package paloo_db
+package buffer
 
 import (
 	"sync"
 	"testing"
+
+	"github.com/daniarleagk/paloo_db/io"
 )
 
 // this function is meant to be called with a -race flag
@@ -24,7 +26,7 @@ func TestConcurrentBufferAccessRace(t *testing.T) {
 		// this go routine always fixes the same block id with id 4
 		go func() {
 			defer wg.Done()
-			pageId := NewPageId(storageId, 4)
+			pageId := io.NewPageId(storageId, 4)
 			frame, err := bm.Fix(pageId)
 			if err != nil {
 				t.Logf("Failed to fix page: %v", err)
@@ -43,7 +45,7 @@ func TestConcurrentBufferAccessRace(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			pageId := NewPageId(storageId, int64(i%elementCount))
+			pageId := io.NewPageId(storageId, int64(i%elementCount))
 			frame, err := bm.Fix(pageId)
 			if err != nil {
 				t.Logf("Failed to fix page: %v", err)

@@ -1,7 +1,7 @@
 // Copyright (c) 2025 Daniar Achakeev
 // This source code is licensed under the MIT license found in the LICENSE.txt file in the root directory of this source tree.
 
-package paloo_db
+package operators
 
 // This file implements a generic external sorter that can sort large datasets that do not fit into memory.
 // TODO: provide abstraction to run generating and merging in parallel
@@ -15,23 +15,30 @@ import (
 	"os"
 	"slices"
 	"sync"
+
+	"github.com/daniarleagk/paloo_db/io"
 )
 
-type RunGenerator[T any] interface {
-	GenerateRuns(input iter.Seq[T]) error
-}
-
-type Merger[T any] interface {
-	MergeSeq(sequences []iter.Seq[RecordWithError[T]]) (iter.Seq[T], error)
-}
-
 type CreateTempFileWriterFactory[T any] interface {
-	CreateTempFileWriter(file *os.File, bufferSize int, serialize func(item T) ([]byte, error)) TempFileWriter[T]
+	CreateTempFileWriter(file *os.File, bufferSize int, serialize func(item T) ([]byte, error)) io.TempFileWriter[T]
 }
 
 type CreateTempFileReaderFactory[T any] interface {
-	CreateTempFileReader() TempFileReader[T]
+	CreateTempFileReader() io.TempFileReader[T]
 }
+
+type RunGenerator[T any] interface {
+	Initialize(
+		comparatorFunc func(a, b T) int,
+		getByteSize func(item T) int,
+		serialize func(item T) ([]byte, error),
+		createTmpFile func(currentRunIndex int, index int) (*os.File, error),
+		tempFileWriterFactory CreateTempFileWriterFactory[T],
+	) error
+	GenerateRuns(input iter.Seq[T]) error
+}
+
+type MergeFunc[T any] func(sequences []iter.Seq[io.RecordWithError[T]], comparatorFunc func(a, b T) int) (iter.Seq[T], error)
 
 // Sorter is a generic external sorter that can sort large datasets that do not fit into memory.
 // main task is to orchestrate the sorting process by generating sorted runs and merging them.
@@ -44,6 +51,8 @@ type Sorter[T any] struct {
 	getByteSize       func(item T) int
 	serialize         func(item T) ([]byte, error)
 	deserialize       func(data []byte) (T, error)
+	runGenerator      RunGenerator[T]
+	mergeFunc         MergeFunc[T]
 	directoryPath     string
 	filePrefix        string
 	fileExtension     string
@@ -53,9 +62,41 @@ type Sorter[T any] struct {
 	kWayMergeSize     int // number of files that would be merged in each round
 }
 
+func NewSorter[T any](
+	comparatorFunc func(a, b T) int,
+	getByteSize func(item T) int,
+	serialize func(item T) ([]byte, error),
+	deserialize func(data []byte) (T, error),
+	runGenerator RunGenerator[T],
+	mergeFunc MergeFunc[T],
+	directoryPath string,
+	filePrefix string,
+	fileExtension string,
+	readBufferSize int,
+	writeBufferSize int,
+	kWayMergeSize int,
+) *Sorter[T] {
+	return &Sorter[T]{
+		comparatorFunc:  comparatorFunc,
+		getByteSize:     getByteSize,
+		serialize:       serialize,
+		deserialize:     deserialize,
+		directoryPath:   directoryPath,
+		filePrefix:      filePrefix,
+		fileExtension:   fileExtension,
+		readBufferSize:  readBufferSize,
+		writeBufferSize: writeBufferSize,
+		kWayMergeSize:   kWayMergeSize,
+	}
+}
+
 func (s *Sorter[T]) Sort(input iter.Seq[T]) (iter.Seq[T], error) {
 	if input == nil {
 		return nil, fmt.Errorf("input iterator is nil")
+	}
+	err := s.runGenerator.GenerateRuns(input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate runs: %v", err)
 	}
 
 	// Implement sorting logic here
@@ -83,45 +124,45 @@ type GoSortRunGenerator[T any] struct {
 	comparatorFunc        func(a, b T) int
 	getByteSize           func(item T) int
 	serialize             func(item T) ([]byte, error)
+	createTmpFile         func(currentRunIndex int, index int) (*os.File, error)
+	tempFileWriterFactory CreateTempFileWriterFactory[T]
 	bufferSize            int // size of the in-memory buffer to hold items before sorting and flushing to disk
 	runSize               int // maximum size of each run in bytes
 	initialRunSize        int // estimated initial size of each run
-	directoryPath         string
-	filePrefix            string
-	fileExtension         string
-	tempFileWriterFactory CreateTempFileWriterFactory[T]
 	sliceBuffer           []T
 	parallelism           int
 }
 
 func NewGoSortRunGenerator[T any](
-	comparatorFunc func(a, b T) int,
-	getByteSize func(item T) int,
-	serialize func(item T) ([]byte, error),
 	bufferSize int,
 	runSize int,
 	initialRunSize int,
-	directoryPath string,
-	filePrefix string,
-	fileExtension string,
-	tempFileWriterFactory CreateTempFileWriterFactory[T],
 	parallelism int,
 ) *GoSortRunGenerator[T] {
 	runGen := &GoSortRunGenerator[T]{
-		comparatorFunc:        comparatorFunc,
-		getByteSize:           getByteSize,
-		serialize:             serialize,
-		bufferSize:            bufferSize,
-		runSize:               runSize,
-		initialRunSize:        initialRunSize,
-		directoryPath:         directoryPath,
-		filePrefix:            filePrefix,
-		fileExtension:         fileExtension,
-		tempFileWriterFactory: tempFileWriterFactory,
-		parallelism:           parallelism,
+		bufferSize:     bufferSize,
+		runSize:        runSize,
+		initialRunSize: initialRunSize,
+		parallelism:    parallelism,
 	}
 	runGen.sliceBuffer = make([]T, 0, initialRunSize)
 	return runGen
+}
+
+func (g *GoSortRunGenerator[T]) Initialize(
+	comparatorFunc func(a, b T) int,
+	getByteSize func(item T) int,
+	serialize func(item T) ([]byte, error),
+	createTmpFile func(currentRunIndex int, index int) (*os.File, error),
+	tempFileWriterFactory CreateTempFileWriterFactory[T],
+) error {
+	// TODO add nil checks for all functions
+	g.comparatorFunc = comparatorFunc
+	g.getByteSize = getByteSize
+	g.serialize = serialize
+	g.createTmpFile = createTmpFile
+	g.tempFileWriterFactory = tempFileWriterFactory
+	return nil
 }
 
 func (g *GoSortRunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
@@ -158,6 +199,9 @@ func (g *GoSortRunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
 	return nil
 }
 
+// sortAndFlush sorts the current sliceBuffer and flushes it to a temporary file using multiple goroutines.
+// It divides the sliceBuffer into chunks and sorts each chunk in parallel, writing each sorted chunk to a separate temporary file.
+// This approach allows for concurrent sorting and writing, improving performance on multi-core systems.
 func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	// sort the sliceBuffer using the comparatorFunc
 	// write the sorted data to a temporary file using the tempFileWriterFactory
@@ -206,23 +250,13 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	return nil
 }
 
-func (g *GoSortRunGenerator[T]) createTmpFile(currentRunIndex int, index int) (*os.File, error) {
-	fileName := fmt.Sprintf("%s/%s_run_%06d_%03d.%s", g.directoryPath, g.filePrefix, currentRunIndex, index, g.fileExtension)
-	return os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
-}
-
-type KWayMerger[T any] struct {
-	comparatorFunc func(a, b T) int
-}
-
-func NewKWayMerger[T any](comparatorFunc func(a, b T) int) *KWayMerger[T] {
-	return &KWayMerger[T]{comparatorFunc: comparatorFunc}
-}
-
-func (m *KWayMerger[T]) MergeSeq(sequences []iter.Seq[RecordWithError[T]]) (iter.Seq[T], error) {
+// MergeHeapFunc has the type of MergeFunc that uses a min-heap to merge sorted sequences.
+// It takes a slice of sorted sequences and a comparator function, and returns a single merged sequence.
+// It returns an error if any of the input sequences yield an error.
+func MergeHeapFunc[T any](sequences []iter.Seq[io.RecordWithError[T]], comparatorFunc func(a, b T) int) (iter.Seq[T], error) {
 	// create heap
 	heapCompare := func(a, b PullIterRecordPair[T]) int {
-		return m.comparatorFunc(a.record, b.record)
+		return comparatorFunc(a.record, b.record)
 	}
 	mergeHeap := &MergeHeap[PullIterRecordPair[T]]{
 		items:   []PullIterRecordPair[T]{},
@@ -275,7 +309,7 @@ func (m *KWayMerger[T]) MergeSeq(sequences []iter.Seq[RecordWithError[T]]) (iter
 // PullIterRecordPair is a helper struct to hold the current record and the next function of an iterator
 type PullIterRecordPair[T any] struct {
 	record T
-	next   func() (RecordWithError[T], bool)
+	next   func() (io.RecordWithError[T], bool)
 	stop   func()
 }
 

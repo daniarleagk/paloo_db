@@ -1,5 +1,5 @@
 // Provides utils to work with I/O and serialization
-package paloo_db
+package utils
 
 // Zero element for generic types
 func Zero[T any]() T {
