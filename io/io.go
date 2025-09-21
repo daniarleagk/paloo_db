@@ -336,6 +336,7 @@ func (r *FixedSizeTempFileReader[T]) All() iter.Seq[RecordWithError[T]] {
 		for {
 			_, err := r.file.Read(r.bufferBlock.data) // initial read
 			if errors.Is(err, io.EOF) {
+				r.file.Close()
 				break
 			}
 			if err != nil {

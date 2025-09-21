@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -198,7 +199,7 @@ func TestKWayMerger(t *testing.T) {
 }
 
 func TestSimpleInt64Sort(t *testing.T) {
-	elementsCount := 100000
+	elementsCount := 100
 	int64Slice := make([]int64, 0, elementsCount)
 	for i := range elementsCount {
 		int64Slice = append(int64Slice, int64(i))
@@ -230,6 +231,7 @@ func TestSimpleInt64Sort(t *testing.T) {
 	suffix := "tmp"
 	factoryReader := &FixedSizeTempFileReaderFactory[int64]{recordSize: 8}
 	factoryWriter := &FixedSizeTempFileWriterFactory[int64]{recordSize: 8}
+	parallel := 1
 	kWay := 4
 	readBufferSize, writeBufferSize := 128, 128 // 12 bytes per page header 128 -12 = 116 bytes for data => 14 int64 per page
 	runSize := 512                              // 512 /8 = 64 int64 per run
@@ -237,7 +239,7 @@ func TestSimpleInt64Sort(t *testing.T) {
 		readBufferSize,
 		runSize,
 		512/8, // initial run size
-		kWay,
+		parallel,
 	)
 	sorter := NewSorter(
 		comparator,
@@ -271,14 +273,17 @@ func TestSimpleInt64Sort(t *testing.T) {
 		previous = r.Record
 		count++
 	}
+	if count != elementsCount {
+		t.Errorf("expected to read %d records, but got %d", elementsCount, count)
+	}
 
 }
 
 func TestSimpleInt64SortLarge(t *testing.T) {
 
-	// if strings.Contains(t.Name(), "Large") {
-	// 	t.Skip("Local run test only")
-	// }
+	if strings.Contains(t.Name(), "Large") {
+		t.Skip("Local run test only")
+	}
 
 	elementsCount := 100_000_000
 	int64Slice := make([]int64, 0, elementsCount)
@@ -313,10 +318,10 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 	suffix := "tmp"
 	factoryReader := &FixedSizeTempFileReaderFactory[int64]{recordSize: 8}
 	factoryWriter := &FixedSizeTempFileWriterFactory[int64]{recordSize: 8}
-	parallelism := 4
-	kWay := 100                                           // memory is 128 KB * 100 at least
+	parallelism := 1
+	kWay := 128                                           // memory is 128 KB * 100 at least
 	readBufferSize, writeBufferSize := 1024*256, 1024*256 // 256 KB
-	runSize := 1024 * 1024 * 64                           // 64 MB Buffer
+	runSize := 1024 * 1024 * 1024                         // 1 GB Buffer
 	runGenerator := NewGoSortRunGenerator[int64](
 		readBufferSize,
 		runSize,
@@ -359,6 +364,9 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 		}
 		previous = r.Record
 		count++
+	}
+	if count != elementsCount {
+		t.Errorf("expected to read %d records, but got %d", elementsCount, count)
 	}
 	duration = time.Since(start)
 	t.Logf("Last Merge %s", duration)

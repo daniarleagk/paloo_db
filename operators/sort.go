@@ -157,7 +157,6 @@ func (s *Sorter[T]) Sort(input iter.Seq[T]) (iter.Seq[io.RecordWithError[T]], er
 		s.deleteFiles(files)
 		isRunStage = false
 		files, err = s.getFilesToMerge(isRunStage, s.currentMergeRound)
-		fmt.Println("Number merged:", len(files))
 		if err != nil {
 			return nil, fmt.Errorf("failed to get files to merge: %v", err)
 		}
@@ -174,7 +173,6 @@ func (s *Sorter[T]) mergeFiles(files []string) (iter.Seq[io.RecordWithError[T]],
 		if err != nil {
 			return nil, fmt.Errorf("failed to open file %s: %v", files[0], err)
 		}
-		defer file.Close()
 		reader := s.tempFileReaderFactory.CreateTempFileReader(file, s.readBufferSize, s.deserialize)
 		return reader.All(), nil
 	}
@@ -184,7 +182,6 @@ func (s *Sorter[T]) mergeFiles(files []string) (iter.Seq[io.RecordWithError[T]],
 		if err != nil {
 			return nil, fmt.Errorf("failed to open file %s: %v", fileName, err)
 		}
-		defer file.Close()
 		reader := s.tempFileReaderFactory.CreateTempFileReader(file, s.readBufferSize, s.deserialize)
 		slicesOfSeq = append(slicesOfSeq, reader.All())
 	}
@@ -223,6 +220,7 @@ func (s *Sorter[T]) flushMergeSequence(mergeSeq iter.Seq[io.RecordWithError[T]],
 	defer file.Close()
 	// create a writer
 	writer := s.tempFileWriterFactory.CreateTempFileWriter(file, s.writeBufferSize, s.serialize)
+	defer writer.Close()
 	err = writer.WriteSeq(func(yield func(T) bool) {
 		for r := range mergeSeq {
 			if r.Error != nil {
@@ -432,6 +430,7 @@ func MergeHeapFunc[T any](sequences []iter.Seq[io.RecordWithError[T]], comparato
 		for mergeHeap.Len() > 0 {
 			// pull the smallest item from the heap
 			item := heap.Pop(mergeHeap).(PullIterRecordPair[T])
+
 			// yield the item
 			if !yield(io.RecordWithError[T]{Record: item.record}) {
 				return
