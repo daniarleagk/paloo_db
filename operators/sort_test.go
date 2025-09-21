@@ -11,6 +11,7 @@ import (
 	"os"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/daniarleagk/paloo_db/io"
 )
@@ -23,7 +24,15 @@ func (f *FixedSizeTempFileWriterFactory[T]) CreateTempFileWriter(file *os.File, 
 	return io.NewFixedSizeTempFileWriter(file, bufferSize, f.recordSize, serialize)
 }
 
-func permutate(slice []int32) []int32 {
+type FixedSizeTempFileReaderFactory[T any] struct {
+	recordSize int
+}
+
+func (f *FixedSizeTempFileReaderFactory[T]) CreateTempFileReader(file *os.File, bufferSize int, deserialize func(data []byte) (T, error)) io.TempFileReader[T] {
+	return io.NewFixedSizeTempFileReader(file, bufferSize, f.recordSize, deserialize)
+}
+
+func permutate[T any](slice []T) []T {
 	n := len(slice)
 	r := rand.New(rand.NewSource(42))
 	for i := n - 1; i > 0; i-- {
@@ -176,14 +185,182 @@ func TestKWayMerger(t *testing.T) {
 	previous := int32(-1)
 	count := 0
 	for r := range mergedSeq {
-		if r < previous {
+		if r.Record < previous {
 			t.Errorf("expected %d, but got %d", previous, r)
 		}
 		//t.Log("sorted record", r)
-		previous = r
+		previous = r.Record
 		count++
 	}
 	if count != allCount {
 		t.Errorf("expected to read %d records, but got %d", allCount, count)
 	}
+}
+
+func TestSimpleInt64Sort(t *testing.T) {
+	elementsCount := 100000
+	int64Slice := make([]int64, 0, elementsCount)
+	for i := range elementsCount {
+		int64Slice = append(int64Slice, int64(i))
+	}
+	int64Slice = permutate(int64Slice)
+	comparator := func(a, b int64) int {
+		return int(a - b)
+	}
+	getByteSize := func(item int64) int {
+		return 8 // size of int64
+	}
+	serialize := func(item int64) ([]byte, error) {
+		buf := new(bytes.Buffer)
+		if err := binary.Write(buf, binary.BigEndian, item); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+	deserialize := func(data []byte) (int64, error) {
+		var record int64
+		buf := bytes.NewReader(data)
+		if err := binary.Read(buf, binary.BigEndian, &record); err != nil {
+			return 0, err
+		}
+		return record, nil
+	}
+	tmpDirectory := t.TempDir()
+	prefix := "int64sort"
+	suffix := "tmp"
+	factoryReader := &FixedSizeTempFileReaderFactory[int64]{recordSize: 8}
+	factoryWriter := &FixedSizeTempFileWriterFactory[int64]{recordSize: 8}
+	kWay := 4
+	readBufferSize, writeBufferSize := 128, 128 // 12 bytes per page header 128 -12 = 116 bytes for data => 14 int64 per page
+	runSize := 512                              // 512 /8 = 64 int64 per run
+	runGenerator := NewGoSortRunGenerator[int64](
+		readBufferSize,
+		runSize,
+		512/8, // initial run size
+		kWay,
+	)
+	sorter := NewSorter(
+		comparator,
+		getByteSize,
+		serialize,
+		deserialize,
+		runGenerator,
+		MergeHeapFunc,
+		factoryReader,
+		factoryWriter,
+		tmpDirectory,
+		prefix,
+		suffix,
+		readBufferSize,
+		writeBufferSize,
+		kWay,
+	)
+	sortedSeq, err := sorter.Sort(slices.Values(int64Slice))
+	if err != nil {
+		t.Fatalf("failed to sort: %v", err)
+	}
+	previous := int64(-1)
+	count := 0
+	for r := range sortedSeq {
+		if r.Error != nil {
+			t.Errorf("read failed: %v", r.Error)
+		}
+		if r.Record < previous {
+			t.Errorf("expected %d, but got %d", previous, r.Record)
+		}
+		previous = r.Record
+		count++
+	}
+
+}
+
+func TestSimpleInt64SortLarge(t *testing.T) {
+
+	// if strings.Contains(t.Name(), "Large") {
+	// 	t.Skip("Local run test only")
+	// }
+
+	elementsCount := 100_000_000
+	int64Slice := make([]int64, 0, elementsCount)
+	for i := range elementsCount {
+		int64Slice = append(int64Slice, int64(i))
+	}
+	int64Slice = permutate(int64Slice)
+	comparator := func(a, b int64) int {
+		return int(a - b)
+	}
+	getByteSize := func(item int64) int {
+		return 8 // size of int64
+	}
+	serialize := func(item int64) ([]byte, error) {
+		buf := new(bytes.Buffer)
+		if err := binary.Write(buf, binary.BigEndian, item); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+	deserialize := func(data []byte) (int64, error) {
+		var record int64
+		buf := bytes.NewReader(data)
+		if err := binary.Read(buf, binary.BigEndian, &record); err != nil {
+			return 0, err
+		}
+		return record, nil
+	}
+	tmpDirectory := t.TempDir()
+	t.Logf("Using temp directory: %s", tmpDirectory)
+	prefix := "int64sort"
+	suffix := "tmp"
+	factoryReader := &FixedSizeTempFileReaderFactory[int64]{recordSize: 8}
+	factoryWriter := &FixedSizeTempFileWriterFactory[int64]{recordSize: 8}
+	parallelism := 4
+	kWay := 100                                           // memory is 128 KB * 100 at least
+	readBufferSize, writeBufferSize := 1024*256, 1024*256 // 256 KB
+	runSize := 1024 * 1024 * 64                           // 64 MB Buffer
+	runGenerator := NewGoSortRunGenerator[int64](
+		readBufferSize,
+		runSize,
+		(1024*512)/8, // initial run size
+		parallelism,
+	)
+	sorter := NewSorter(
+		comparator,
+		getByteSize,
+		serialize,
+		deserialize,
+		runGenerator,
+		MergeHeapFunc,
+		factoryReader,
+		factoryWriter,
+		tmpDirectory,
+		prefix,
+		suffix,
+		readBufferSize,
+		writeBufferSize,
+		kWay,
+	)
+	start := time.Now()
+	sortedSeq, err := sorter.Sort(slices.Values(int64Slice))
+	duration := time.Since(start)
+	t.Logf("Sort -1 merge %s", duration)
+
+	if err != nil {
+		t.Fatalf("failed to sort: %v", err)
+	}
+	previous := int64(-1)
+	count := 0
+	start = time.Now()
+	for r := range sortedSeq {
+		if r.Error != nil {
+			t.Errorf("read failed: %v", r.Error)
+		}
+		if r.Record < previous {
+			t.Errorf("expected %d, but got %d", previous, r.Record)
+		}
+		previous = r.Record
+		count++
+	}
+	duration = time.Since(start)
+	t.Logf("Last Merge %s", duration)
+
 }
