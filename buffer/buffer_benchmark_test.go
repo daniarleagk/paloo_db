@@ -1,10 +1,12 @@
 //go:build !race
 
-package paloo_db
+package buffer
 
 import (
 	"sync/atomic"
 	"testing"
+
+	"github.com/daniarleagk/paloo_db/io"
 )
 
 func BenchmarkConcurrentBufferAccessLockBased(b *testing.B) {
@@ -22,7 +24,7 @@ func BenchmarkConcurrentBufferAccessLockBased(b *testing.B) {
 		for pb.Next() {
 			caller := func() {
 				i := atomic.LoadInt32(&idx)
-				pageId := NewPageId(storageId, int64(int(i)%elementCount))
+				pageId := io.NewPageId(storageId, int64(int(i)%elementCount))
 				b.StopTimer()
 				frame, err := bm.Fix(pageId)
 				if err != nil {
@@ -62,7 +64,7 @@ func BenchmarkConcurrentBufferAccessChannel(b *testing.B) {
 		for pb.Next() {
 			caller := func() {
 				i := atomic.LoadInt32(&idx)
-				pageId := NewPageId(storageId, int64(int(i)%elementCount))
+				pageId := io.NewPageId(storageId, int64(int(i)%elementCount))
 				b.StopTimer()
 				frame, err := bm.Fix(pageId)
 				if err != nil {

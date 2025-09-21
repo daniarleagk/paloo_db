@@ -1,6 +1,6 @@
 //go:build !race
 
-package paloo_db
+package utils
 
 import (
 	"testing"

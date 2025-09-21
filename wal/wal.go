@@ -1,6 +1,6 @@
 // Copyright (c) 2025 Daniar Achakeev
 // This source code is licensed under the MIT license found in the LICENSE.txt file in the root directory
-package paloo_db
+package wal
 
 import (
 	"io"
