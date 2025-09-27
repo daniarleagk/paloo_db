@@ -23,7 +23,7 @@ import (
 )
 
 type CreateTempFileWriterFactory[T any] interface {
-	CreateTempFileWriter(file *os.File, bufferSize int, serialize func(item T) ([]byte, error)) io.TempFileWriter[T]
+	CreateTempFileWriter(file *os.File, bufferSize int, serialize func(item T, buf []byte) error) io.TempFileWriter[T]
 }
 
 type CreateTempFileReaderFactory[T any] interface {
@@ -34,7 +34,7 @@ type RunGenerator[T any] interface {
 	Initialize(
 		comparatorFunc func(a, b T) int,
 		getByteSize func(item T) int,
-		serialize func(item T) ([]byte, error),
+		serialize func(item T, buf []byte) error,
 		createTmpFile func(currentRunIndex int, index int) (*os.File, error),
 		tempFileWriterFactory CreateTempFileWriterFactory[T],
 	) error
@@ -52,7 +52,7 @@ type MergeFunc[T any] func(sequences []iter.Seq[io.RecordWithError[T]], comparat
 type Sorter[T any] struct {
 	comparatorFunc        func(a, b T) int
 	getByteSize           func(item T) int
-	serialize             func(item T) ([]byte, error)
+	serialize             func(item T, buf []byte) error
 	deserialize           func(data []byte) (T, error)
 	tempFileReaderFactory CreateTempFileReaderFactory[T]
 	tempFileWriterFactory CreateTempFileWriterFactory[T]
@@ -72,7 +72,7 @@ type Sorter[T any] struct {
 func NewSorter[T any](
 	comparatorFunc func(a, b T) int,
 	getByteSize func(item T) int,
-	serialize func(item T) ([]byte, error),
+	serialize func(item T, buf []byte) error,
 	deserialize func(data []byte) (T, error),
 	runGenerator RunGenerator[T],
 	mergeFunc MergeFunc[T],
@@ -268,7 +268,7 @@ func (s *Sorter[T]) Close() error {
 type GoSortRunGenerator[T any] struct {
 	comparatorFunc        func(a, b T) int
 	getByteSize           func(item T) int
-	serialize             func(item T) ([]byte, error)
+	serialize             func(item T, buf []byte) error
 	createTmpFile         func(currentRunIndex int, index int) (*os.File, error)
 	tempFileWriterFactory CreateTempFileWriterFactory[T]
 	bufferSize            int // size of the in-memory buffer to hold items before sorting and flushing to disk
@@ -297,7 +297,7 @@ func NewGoSortRunGenerator[T any](
 func (g *GoSortRunGenerator[T]) Initialize(
 	comparatorFunc func(a, b T) int,
 	getByteSize func(item T) int,
-	serialize func(item T) ([]byte, error),
+	serialize func(item T, buf []byte) error,
 	createTmpFile func(currentRunIndex int, index int) (*os.File, error),
 	tempFileWriterFactory CreateTempFileWriterFactory[T],
 ) error {
@@ -430,7 +430,6 @@ func MergeHeapFunc[T any](sequences []iter.Seq[io.RecordWithError[T]], comparato
 		for mergeHeap.Len() > 0 {
 			// pull the smallest item from the heap
 			item := heap.Pop(mergeHeap).(PullIterRecordPair[T])
-
 			// yield the item
 			if !yield(io.RecordWithError[T]{Record: item.record}) {
 				return

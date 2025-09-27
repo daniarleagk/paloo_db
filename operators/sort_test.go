@@ -3,7 +3,6 @@
 package operators
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"iter"
@@ -21,7 +20,7 @@ type FixedSizeTempFileWriterFactory[T any] struct {
 	recordSize int
 }
 
-func (f *FixedSizeTempFileWriterFactory[T]) CreateTempFileWriter(file *os.File, bufferSize int, serialize func(item T) ([]byte, error)) io.TempFileWriter[T] {
+func (f *FixedSizeTempFileWriterFactory[T]) CreateTempFileWriter(file *os.File, bufferSize int, serialize func(item T, buf []byte) error) io.TempFileWriter[T] {
 	return io.NewFixedSizeTempFileWriter(file, bufferSize, f.recordSize, serialize)
 }
 
@@ -58,13 +57,11 @@ func TestGoSortRunGenerator(t *testing.T) {
 		int32Slice = append(int32Slice, int32(i))
 	}
 	int32Slice = permutate(int32Slice)
-	serialize := func(item int32) ([]byte, error) {
-		buf := new(bytes.Buffer)
-		if err := binary.Write(buf, binary.BigEndian, item); err != nil {
-			return nil, err
-		}
-		return buf.Bytes(), nil
+	serialize := func(item int32, buf []byte) error {
+		binary.BigEndian.PutUint32(buf, uint32(item))
+		return nil
 	}
+
 	comparator := func(a, b int32) int {
 		return int(a - b)
 	}
@@ -101,12 +98,7 @@ func TestGoSortRunGenerator(t *testing.T) {
 	}
 	slices.Sort(files)
 	deserialize := func(data []byte) (int32, error) {
-		var record int32
-		buf := bytes.NewReader(data)
-		if err := binary.Read(buf, binary.BigEndian, &record); err != nil {
-			return 0, err
-		}
-		return record, nil
+		return int32(binary.BigEndian.Uint32(data)), nil
 	}
 	t.Log("Generated files:", files)
 	count := 0
@@ -211,20 +203,12 @@ func TestSimpleInt64Sort(t *testing.T) {
 	getByteSize := func(item int64) int {
 		return 8 // size of int64
 	}
-	serialize := func(item int64) ([]byte, error) {
-		buf := new(bytes.Buffer)
-		if err := binary.Write(buf, binary.BigEndian, item); err != nil {
-			return nil, err
-		}
-		return buf.Bytes(), nil
+	serialize := func(item int64, buf []byte) error {
+		binary.BigEndian.PutUint64(buf, uint64(item))
+		return nil
 	}
 	deserialize := func(data []byte) (int64, error) {
-		var record int64
-		buf := bytes.NewReader(data)
-		if err := binary.Read(buf, binary.BigEndian, &record); err != nil {
-			return 0, err
-		}
-		return record, nil
+		return int64(binary.BigEndian.Uint64(data)), nil
 	}
 	tmpDirectory := t.TempDir()
 	prefix := "int64sort"
@@ -297,20 +281,12 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 	getByteSize := func(item int64) int {
 		return 8 // size of int64
 	}
-	serialize := func(item int64) ([]byte, error) {
-		buf := new(bytes.Buffer)
-		if err := binary.Write(buf, binary.BigEndian, item); err != nil {
-			return nil, err
-		}
-		return buf.Bytes(), nil
+	serialize := func(item int64, buf []byte) error {
+		binary.BigEndian.PutUint64(buf, uint64(item))
+		return nil
 	}
 	deserialize := func(data []byte) (int64, error) {
-		var record int64
-		buf := bytes.NewReader(data)
-		if err := binary.Read(buf, binary.BigEndian, &record); err != nil {
-			return 0, err
-		}
-		return record, nil
+		return int64(binary.BigEndian.Uint64(data)), nil
 	}
 	tmpDirectory := t.TempDir()
 	t.Logf("Using temp directory: %s", tmpDirectory)
@@ -318,10 +294,10 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 	suffix := "tmp"
 	factoryReader := &FixedSizeTempFileReaderFactory[int64]{recordSize: 8}
 	factoryWriter := &FixedSizeTempFileWriterFactory[int64]{recordSize: 8}
-	parallelism := 1
-	kWay := 128                                           // memory is 128 KB * 100 at least
+	parallelism := 4
+	kWay := 64                                            // memory is 128 KB * 100 at least
 	readBufferSize, writeBufferSize := 1024*256, 1024*256 // 256 KB
-	runSize := 1024 * 1024 * 1024                         // 1 GB Buffer
+	runSize := 1024 * 1024 * 16                           // 16 MB Buffer
 	runGenerator := NewGoSortRunGenerator[int64](
 		readBufferSize,
 		runSize,

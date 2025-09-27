@@ -256,12 +256,12 @@ type TempFileReader[T any] interface {
 type FixedSizeTempFileWriter[T any] struct {
 	file        *os.File
 	bufferSize  int
-	serialize   func(item T) ([]byte, error)
+	serialize   func(item T, buf []byte) error
 	bufferBlock FixedSizeRecordBlock
 	recordSize  int
 }
 
-func NewFixedSizeTempFileWriter[T any](file *os.File, bufferSize int, recordSize int, serialize func(item T) ([]byte, error)) *FixedSizeTempFileWriter[T] {
+func NewFixedSizeTempFileWriter[T any](file *os.File, bufferSize int, recordSize int, serialize func(item T, buf []byte) error) *FixedSizeTempFileWriter[T] {
 	return &FixedSizeTempFileWriter[T]{
 		file:        file,
 		bufferSize:  bufferSize,
@@ -272,18 +272,19 @@ func NewFixedSizeTempFileWriter[T any](file *os.File, bufferSize int, recordSize
 }
 
 func (w *FixedSizeTempFileWriter[T]) WriteSeq(recordSeq iter.Seq[T]) error {
+	buf := make([]byte, w.recordSize) // allocate buffer
 	for record := range recordSeq {
-		data, err := w.serialize(record)
+		err := w.serialize(record, buf)
 		if err != nil {
 			return err
 		}
-		ok := w.bufferBlock.Append(data)
+		ok := w.bufferBlock.Append(buf)
 		if !ok {
 			if err := w.Flush(); err != nil {
 				return err
 			}
 			w.bufferBlock.Reset()
-			w.bufferBlock.Append(data)
+			w.bufferBlock.Append(buf)
 		}
 	}
 	// flush remaining data
