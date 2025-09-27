@@ -245,12 +245,9 @@ func TestFixedSizeRecordWriterReader(t *testing.T) {
 	}
 	defer f.Close()
 	// Create a FixedSizeTempFileWriter
-	serialize := func(item int32) ([]byte, error) {
-		buf := new(bytes.Buffer)
-		if err := binary.Write(buf, binary.BigEndian, item); err != nil {
-			return nil, err
-		}
-		return buf.Bytes(), nil
+	serialize := func(item int32, buf []byte) error {
+		binary.BigEndian.PutUint64(buf, uint64(item))
+		return nil
 	}
 	// NOTE the header per buffer is 12 bytes
 	// current capacity is 64 - 12 = 52
