@@ -408,12 +408,12 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 		defer close(chunksChan)
 		// merge all chunks into a single sorted sequence
 		sortedSeq, err = MergeHeapFunc(chunks, g.comparatorFunc)
+		//sortedSeq, err = MergeTournamentFunc(chunks, g.comparatorFunc)
 		if err != nil {
 			return fmt.Errorf("failed to merge sorted chunks: %v", err)
 		}
 	} else {
 		// Sort the entire sliceBuffer
-
 		start := time.Now()
 		slices.SortFunc(g.sliceBuffer, g.comparatorFunc)
 		duration := time.Since(start)
@@ -546,14 +546,59 @@ func (h *MergeHeap[T]) Pop() any {
 	return x
 }
 
+func MergeTournamentFunc[T any](sequences []iter.Seq[io.RecordWithError[T]], comparatorFunc func(a, b T) int) (iter.Seq[io.RecordWithError[T]], error) {
+	// create tournament tree
+	tournament := NewTournamentTree(func(a, b PullIterRecordPair[T]) int {
+		return comparatorFunc(a.record, b.record)
+	})
+	contestents := make([]*PullIterRecordPair[T], len(sequences))
+	for i, s := range sequences {
+		next, stop := iter.Pull(s)
+		r, ok := next()
+		if !ok {
+			contestents[i] = nil // sentinel
+			continue
+		}
+		if r.Error != nil {
+			return nil, r.Error
+		}
+		contestents[i] = &PullIterRecordPair[T]{record: r.Record, next: next, stop: stop}
+	}
+	tournament.VeryFirstTournament(contestents)
+	return func(yield func(io.RecordWithError[T]) bool) {
+		// repeatedly pull the smallest item from the tournament tree
+		for {
+			winner, ok := tournament.Winner()
+			if !ok || winner.value == nil {
+				// all sources exhausted
+				return
+			}
+			winnerValue := winner.value
+			yieldRecord := io.RecordWithError[T]{Record: winnerValue.record}
+			if !yield(yieldRecord) {
+				return
+			}
+			nextRecord, ok := winnerValue.next()
+			if !ok {
+				// source exhausted
+				winner.value = nil
+				winner.winner = nil
+
+				tournament.Challenge(winner)
+				winnerValue.stop()
+				continue
+			}
+			winnerValue.record = nextRecord.Record
+			tournament.Challenge(winner)
+		}
+	}, nil
+}
+
+// TournamentNode: represents a node in the tournament tree used for k-way merging.
 type TournamentNode[T any] struct {
 	winner *TournamentNode[T]
 	idx    int // source index of the looser
 	value  *T  // value of the looser
-}
-
-func (t TournamentNode[T]) IsSentinel() bool {
-	return t.value == nil
 }
 
 func (t TournamentNode[T]) String() string {

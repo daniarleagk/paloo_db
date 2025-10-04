@@ -312,8 +312,54 @@ func TestTournamentTreeBuild(t *testing.T) {
 	if ok {
 		t.Fatalf("expected no winner, but got one")
 	}
-
 }
+
+func TestTournamentMerge(t *testing.T) {
+	k := 5
+	sequences := make([]iter.Seq[io.RecordWithError[int32]], 0)
+	allCount := 0
+	slice := make([]int32, 0)
+	numElements := 53
+	for i := range numElements {
+		slice = append(slice, int32(i))
+		allCount++
+	}
+	chunkSize := (numElements + k - 1) / k
+	for i := range k {
+		start := i * chunkSize
+		end := min(start+chunkSize, numElements)
+		if start >= end {
+			continue
+		}
+		subSlice := slice[start:end]
+		t.Log("Sequence", i, "from", start, "to", end, "size", len(subSlice), "contents:", subSlice)
+		mappedIt := Map(slices.Values(subSlice), func(v int32) io.RecordWithError[int32] {
+			return io.RecordWithError[int32]{Record: v, Error: nil}
+		})
+		sequences = append(sequences, mappedIt)
+	}
+	t.Logf("Merging %d sequences", len(sequences))
+	mergedSeq, err := MergeTournamentFunc(sequences, func(a, b int32) int {
+		return int(a - b)
+	})
+	if err != nil {
+		t.Fatalf("failed to merge sequences: %v", err)
+	}
+	previous := int32(-1)
+	count := 0
+	for r := range mergedSeq {
+		if r.Record < previous {
+			t.Errorf("expected %d, but got %d", previous, r)
+		}
+		//t.Log("sorted record", r)
+		previous = r.Record
+		count++
+	}
+	if count != allCount {
+		t.Errorf("expected to read %d records, but got %d", allCount, count)
+	}
+}
+
 func TestSimpleInt64Sort(t *testing.T) {
 	elementsCount := 100
 	int64Slice := make([]int64, 0, elementsCount)
@@ -418,7 +464,7 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 	suffix := "tmp"
 	factoryReader := &FixedSizeTempFileReaderFactory[int64]{recordSize: 8}
 	factoryWriter := &FixedSizeTempFileWriterFactory[int64]{recordSize: 8}
-	parallelism := 1
+	parallelism := 8
 	kWay := 64                                            // memory is 128 KB * 100 at least
 	readBufferSize, writeBufferSize := 1024*256, 1024*256 // 256 KB
 	runSize := 1024 * 1024 * 32                           // 32 MB Buffer
