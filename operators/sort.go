@@ -64,7 +64,7 @@ type Sorter[T any] struct {
 	currentMergeRound     int
 	readBufferSize        int
 	writeBufferSize       int
-	kWayMergeSize         int // number of files that would be merged in each round
+	kWayMergeSize         int // max number of files that would be merged in each round
 	runStr                string
 	mergeStr              string
 }
@@ -208,9 +208,6 @@ func (s *Sorter[T]) getFilesToMerge(isRun bool, level int) ([]string, error) {
 
 func (s *Sorter[T]) flushMergeSequence(mergeSeq iter.Seq[io.RecordWithError[T]], currentMergeRound int, index int) error {
 	// create a new temporary file for the merged output
-	// use the tempFileWriterFactory to create a writer
-	// write the merged sequence to the file
-	// close the file
 	// realistically index is 6 decimal digits
 	fileName := fmt.Sprintf("%s/%s_%s_%d_%06d.%s", s.directoryPath, s.filePrefix, s.mergeStr, currentMergeRound, index, s.fileExtension)
 	file, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
@@ -276,6 +273,7 @@ type GoSortRunGenerator[T any] struct {
 	initialRunSize        int // estimated initial size of each run
 	sliceBuffer           []T
 	parallelism           int
+	mergeFunc             MergeFunc[T]
 }
 
 func NewGoSortRunGenerator[T any](
@@ -283,12 +281,14 @@ func NewGoSortRunGenerator[T any](
 	runSize int,
 	initialRunSize int,
 	parallelism int,
+	mergeFunc MergeFunc[T],
 ) *GoSortRunGenerator[T] {
 	runGen := &GoSortRunGenerator[T]{
 		bufferSize:     bufferSize,
 		runSize:        runSize,
 		initialRunSize: initialRunSize,
 		parallelism:    parallelism,
+		mergeFunc:      mergeFunc,
 	}
 	runGen.sliceBuffer = make([]T, 0, initialRunSize)
 	return runGen
@@ -358,7 +358,6 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 		chunksChan := make(chan []T, g.parallelism)
 		defer close(errorsChan)
 		chunkSize := (len(g.sliceBuffer) + g.parallelism - 1) / g.parallelism
-
 		start := time.Now()
 		for i := 0; i < g.parallelism; i++ {
 			wg.Add(1)
@@ -406,8 +405,9 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 		}
 		// Close the chunks channel
 		defer close(chunksChan)
+		// single threaded merge now to
 		// merge all chunks into a single sorted sequence
-		sortedSeq, err = MergeHeapFunc(chunks, g.comparatorFunc)
+		sortedSeq, err = g.mergeFunc(chunks, g.comparatorFunc)
 		//sortedSeq, err = MergeTournamentFunc(chunks, g.comparatorFunc)
 		if err != nil {
 			return fmt.Errorf("failed to merge sorted chunks: %v", err)

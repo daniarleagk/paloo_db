@@ -74,6 +74,7 @@ func TestGoSortRunGenerator(t *testing.T) {
 		runSizeByteMemory,   // run size
 		128/4,               // initial run size
 		parallelism,         // parallelism
+		MergeHeapFunc[int32],
 	)
 	createTmpFile := func(currentRunIndex int, index int) (*os.File, error) {
 		fileName := fmt.Sprintf("%s/%s_run_%06d_%03d.%s", directory, "sort", currentRunIndex, index, "tmp")
@@ -394,6 +395,7 @@ func TestSimpleInt64Sort(t *testing.T) {
 		runSize,
 		512/8, // initial run size
 		parallel,
+		MergeHeapFunc[int64],
 	)
 	sorter := NewSorter(
 		comparator,
@@ -458,63 +460,81 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 	deserialize := func(data []byte) (int64, error) {
 		return int64(binary.BigEndian.Uint64(data)), nil
 	}
-	tmpDirectory := t.TempDir()
-	t.Logf("Using temp directory: %s", tmpDirectory)
-	prefix := "int64sort"
-	suffix := "tmp"
-	factoryReader := &FixedSizeTempFileReaderFactory[int64]{recordSize: 8}
-	factoryWriter := &FixedSizeTempFileWriterFactory[int64]{recordSize: 8}
-	parallelism := 8
-	kWay := 64                                            // memory is 128 KB * 100 at least
-	readBufferSize, writeBufferSize := 1024*256, 1024*256 // 256 KB
-	runSize := 1024 * 1024 * 32                           // 32 MB Buffer
-	runGenerator := NewGoSortRunGenerator[int64](
-		readBufferSize,
-		runSize,
-		(runSize)/8*2, // initial run size
-		parallelism,
-	)
-	sorter := NewSorter(
-		comparator,
-		getByteSize,
-		serialize,
-		deserialize,
-		runGenerator,
-		MergeHeapFunc,
-		factoryReader,
-		factoryWriter,
-		tmpDirectory,
-		prefix,
-		suffix,
-		readBufferSize,
-		writeBufferSize,
-		kWay,
-	)
-	start := time.Now()
-	sortedSeq, err := sorter.Sort(slices.Values(int64Slice))
-	duration := time.Since(start)
-	t.Logf("Sort -1 merge %s", duration)
+	tests := []struct {
+		name string
+		heap bool
+	}{
+		{"Heap", true},
+		{"Tournament", false},
+	}
+	for _, tt := range tests {
+		t.Logf("Running test: %s", tt.name)
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDirectory := t.TempDir()
+			t.Logf("Using temp directory: %s", tmpDirectory)
+			prefix := "int64sort"
+			suffix := "tmp"
+			var mergeFunc MergeFunc[int64]
+			if tt.heap {
+				mergeFunc = MergeHeapFunc
+			} else {
+				mergeFunc = MergeTournamentFunc
+			}
+			factoryReader := &FixedSizeTempFileReaderFactory[int64]{recordSize: 8}
+			factoryWriter := &FixedSizeTempFileWriterFactory[int64]{recordSize: 8}
+			parallelism := 1
+			kWay := 64                                            // memory is 128 KB * 100 at least
+			readBufferSize, writeBufferSize := 1024*256, 1024*256 // 256 KB
+			runSize := 1024 * 1024 * 16                           // 16 MB Buffer
+			runGenerator := NewGoSortRunGenerator(
+				readBufferSize,
+				runSize,
+				(runSize)/8*2, // initial run size
+				parallelism,
+				mergeFunc,
+			)
+			sorter := NewSorter(
+				comparator,
+				getByteSize,
+				serialize,
+				deserialize,
+				runGenerator,
+				mergeFunc,
+				factoryReader,
+				factoryWriter,
+				tmpDirectory,
+				prefix,
+				suffix,
+				readBufferSize,
+				writeBufferSize,
+				kWay,
+			)
+			start := time.Now()
+			sortedSeq, err := sorter.Sort(slices.Values(int64Slice))
+			duration := time.Since(start)
+			t.Logf("Sort -1 merge %s", duration)
 
-	if err != nil {
-		t.Fatalf("failed to sort: %v", err)
+			if err != nil {
+				t.Fatalf("failed to sort: %v", err)
+			}
+			previous := int64(-1)
+			count := 0
+			start = time.Now()
+			for r := range sortedSeq {
+				if r.Error != nil {
+					t.Errorf("read failed: %v", r.Error)
+				}
+				if r.Record < previous {
+					t.Errorf("expected %d, but got %d", previous, r.Record)
+				}
+				previous = r.Record
+				count++
+			}
+			if count != elementsCount {
+				t.Errorf("expected to read %d records, but got %d", elementsCount, count)
+			}
+			duration = time.Since(start)
+			t.Logf("Last Merge %s", duration)
+		})
 	}
-	previous := int64(-1)
-	count := 0
-	start = time.Now()
-	for r := range sortedSeq {
-		if r.Error != nil {
-			t.Errorf("read failed: %v", r.Error)
-		}
-		if r.Record < previous {
-			t.Errorf("expected %d, but got %d", previous, r.Record)
-		}
-		previous = r.Record
-		count++
-	}
-	if count != elementsCount {
-		t.Errorf("expected to read %d records, but got %d", elementsCount, count)
-	}
-	duration = time.Since(start)
-	t.Logf("Last Merge %s", duration)
-
 }
