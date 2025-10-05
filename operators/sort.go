@@ -17,7 +17,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/daniarleagk/paloo_db/io"
 )
@@ -49,6 +48,8 @@ type MergeFunc[T any] func(sequences []iter.Seq[io.RecordWithError[T]], comparat
 // It uses a combination of in-memory sorting and external sorting techniques to achieve this.
 // currently, we will implement a simple sorting with comparator on deserialized items
 // TODO: implement also comparators based on serialized items to avoid deserialization overhead
+// TODO: if data can fully fit into memory, we can use in-memory sorting algorithms, fall back to external sorting otherwise
+// TODO: since we process data in chunks and temp files are block oriented, we could also think about parallelizing flushing to disk and reading from disk
 type Sorter[T any] struct {
 	comparatorFunc        func(a, b T) int
 	getByteSize           func(item T) int
@@ -64,7 +65,7 @@ type Sorter[T any] struct {
 	currentMergeRound     int
 	readBufferSize        int
 	writeBufferSize       int
-	kWayMergeSize         int // number of files that would be merged in each round
+	kWayMergeSize         int // max number of files that would be merged in each round
 	runStr                string
 	mergeStr              string
 }
@@ -139,14 +140,11 @@ func (s *Sorter[T]) Sort(input iter.Seq[T]) (iter.Seq[io.RecordWithError[T]], er
 		for i := 0; i < len(files); i += s.kWayMergeSize {
 			end := min(i+s.kWayMergeSize, len(files))
 			batch := files[i:end]
-			start := time.Now()
 			mergeSeq, err := s.mergeFiles(batch)
 			if err != nil {
 				return nil, fmt.Errorf("failed to merge files: %v", err)
 			}
 			err = s.flushMergeSequence(mergeSeq, s.currentMergeRound, i)
-			duration := time.Since(start)
-			fmt.Printf("Sort merge %s %d %d %d \n", duration, s.currentMergeRound, i, end)
 			if err != nil {
 				return nil, fmt.Errorf("failed to flush merge sequence: %v", err)
 			}
@@ -208,9 +206,6 @@ func (s *Sorter[T]) getFilesToMerge(isRun bool, level int) ([]string, error) {
 
 func (s *Sorter[T]) flushMergeSequence(mergeSeq iter.Seq[io.RecordWithError[T]], currentMergeRound int, index int) error {
 	// create a new temporary file for the merged output
-	// use the tempFileWriterFactory to create a writer
-	// write the merged sequence to the file
-	// close the file
 	// realistically index is 6 decimal digits
 	fileName := fmt.Sprintf("%s/%s_%s_%d_%06d.%s", s.directoryPath, s.filePrefix, s.mergeStr, currentMergeRound, index, s.fileExtension)
 	file, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
@@ -276,6 +271,7 @@ type GoSortRunGenerator[T any] struct {
 	initialRunSize        int // estimated initial size of each run
 	sliceBuffer           []T
 	parallelism           int
+	mergeFunc             MergeFunc[T]
 }
 
 func NewGoSortRunGenerator[T any](
@@ -283,12 +279,14 @@ func NewGoSortRunGenerator[T any](
 	runSize int,
 	initialRunSize int,
 	parallelism int,
+	mergeFunc MergeFunc[T],
 ) *GoSortRunGenerator[T] {
 	runGen := &GoSortRunGenerator[T]{
 		bufferSize:     bufferSize,
 		runSize:        runSize,
 		initialRunSize: initialRunSize,
 		parallelism:    parallelism,
+		mergeFunc:      mergeFunc,
 	}
 	runGen.sliceBuffer = make([]T, 0, initialRunSize)
 	return runGen
@@ -348,6 +346,102 @@ func (g *GoSortRunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
 // It divides the sliceBuffer into chunks and sorts each chunk in parallel, writing each sorted chunk to a separate temporary file.
 // This approach allows for concurrent sorting and writing, improving performance on multi-core systems.
 func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
+	// current plan not to use errgroup
+	// change in the future if needed
+	var sortedSeq iter.Seq[io.RecordWithError[T]]
+	var err error
+	if g.parallelism > 1 {
+		var wg sync.WaitGroup
+		errorsChan := make(chan error, g.parallelism)
+		chunksChan := make(chan []T, g.parallelism)
+		defer close(errorsChan)
+		chunkSize := (len(g.sliceBuffer) + g.parallelism - 1) / g.parallelism
+		for i := 0; i < g.parallelism; i++ {
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				start := i * chunkSize
+				if start >= len(g.sliceBuffer) {
+					// no more data to process
+					return
+				}
+				end := min((i+1)*chunkSize, len(g.sliceBuffer))
+				part := g.sliceBuffer[start:end]
+				// Sort the chunk
+				slices.SortFunc(part, g.comparatorFunc)
+				// Send the sorted chunk to the chunks channel
+				chunksChan <- part
+			}(i)
+		}
+		wg.Wait()
+		// Check for any errors
+		select {
+		case err := <-errorsChan:
+			return err
+		default:
+		}
+		// Close the chunks channel to signal that no more chunks will be sent
+		// This is safe to do here because all goroutines have completed
+		// and no more chunks will be sent
+		// get all chunks from the channel
+		chunks := make([]iter.Seq[io.RecordWithError[T]], 0, g.parallelism)
+		mapToRecordWithError := func(seq iter.Seq[T]) iter.Seq[io.RecordWithError[T]] {
+			return func(yield func(io.RecordWithError[T]) bool) {
+				for item := range seq {
+					if !yield(io.RecordWithError[T]{Record: item, Error: nil}) {
+						break
+					}
+				}
+			}
+		}
+		for len(chunksChan) > 0 {
+			chunk := <-chunksChan
+			chunks = append(chunks, mapToRecordWithError(slices.Values(chunk)))
+		}
+		// Close the chunks channel
+		defer close(chunksChan)
+		// single threaded merge now to
+		// merge all chunks into a single sorted sequence
+		sortedSeq, err = g.mergeFunc(chunks, g.comparatorFunc)
+		//sortedSeq, err = MergeTournamentFunc(chunks, g.comparatorFunc)
+		if err != nil {
+			return fmt.Errorf("failed to merge sorted chunks: %v", err)
+		}
+	} else {
+		// Sort the entire sliceBuffer
+		slices.SortFunc(g.sliceBuffer, g.comparatorFunc)
+		// Create a sequence from the sorted sliceBuffer
+		sortedSeq = func(yield func(io.RecordWithError[T]) bool) {
+			for _, item := range g.sliceBuffer {
+				if !yield(io.RecordWithError[T]{Record: item, Error: nil}) {
+					break
+				}
+			}
+		}
+	}
+	tmpFile, err := g.createTmpFile(currentRunIndex, 0)
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file: %v", err)
+	}
+	defer tmpFile.Close()
+	writer := g.tempFileWriterFactory.CreateTempFileWriter(tmpFile, g.bufferSize, g.serialize)
+	if err := writer.WriteSeq(func(yield func(T) bool) {
+		for r := range sortedSeq {
+			if r.Error != nil {
+				// stop on error
+				return
+			}
+			if !yield(r.Record) {
+				break
+			}
+		}
+	}); err != nil {
+		return fmt.Errorf("failed to write merged sequence to temporary file: %v", err)
+	}
+	return nil
+}
+
+/* func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	// sort the sliceBuffer using the comparatorFunc
 	// write the sorted data to a temporary file using the tempFileWriterFactory
 	// current length of the sliceBuffer
@@ -394,6 +488,7 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	}
 	return nil
 }
+*/
 
 // MergeHeapFunc has the type of MergeFunc that uses a min-heap to merge sorted sequences.
 // It takes a slice of sorted sequences and a comparator function, and returns a single merged sequence.
@@ -487,4 +582,212 @@ func (h *MergeHeap[T]) Pop() any {
 	x := old[n-1]
 	h.items = old[0 : n-1]
 	return x
+}
+
+func MergeTournamentFunc[T any](sequences []iter.Seq[io.RecordWithError[T]], comparatorFunc func(a, b T) int) (iter.Seq[io.RecordWithError[T]], error) {
+	// create tournament tree
+	tournament := NewTournamentTree(func(a, b PullIterRecordPair[T]) int {
+		return comparatorFunc(a.record, b.record)
+	})
+	contestents := make([]*PullIterRecordPair[T], len(sequences))
+	for i, s := range sequences {
+		next, stop := iter.Pull(s)
+		r, ok := next()
+		if !ok {
+			contestents[i] = nil // sentinel
+			continue
+		}
+		if r.Error != nil {
+			return nil, r.Error
+		}
+		contestents[i] = &PullIterRecordPair[T]{record: r.Record, next: next, stop: stop}
+	}
+	tournament.VeryFirstTournament(contestents)
+	return func(yield func(io.RecordWithError[T]) bool) {
+		// repeatedly pull the smallest item from the tournament tree
+		for {
+			winner, ok := tournament.Winner()
+			if !ok || winner.value == nil {
+				// all sources exhausted
+				return
+			}
+			winnerValue := winner.value
+			yieldRecord := io.RecordWithError[T]{Record: winnerValue.record}
+			if !yield(yieldRecord) {
+				return
+			}
+			nextRecord, ok := winnerValue.next()
+			if !ok {
+				// source exhausted
+				winner.value = nil
+				winner.winner = nil
+
+				tournament.Challenge(winner)
+				winnerValue.stop()
+				continue
+			}
+			winnerValue.record = nextRecord.Record
+			tournament.Challenge(winner)
+		}
+	}, nil
+}
+
+// TournamentNode: represents a node in the tournament tree used for k-way merging.
+type TournamentNode[T any] struct {
+	winner *TournamentNode[T]
+	idx    int // source index of the looser
+	value  *T  // value of the looser
+}
+
+func (t TournamentNode[T]) String() string {
+	strValue := fmt.Sprintf("%v", t.value)
+	hasWinner := "nil"
+	if t.winner != nil {
+		hasWinner = fmt.Sprintf("idx=%d val=%v", t.winner.idx, t.winner.value)
+	}
+	return fmt.Sprintf("Node(idx=%d, value=%s) winner [ %s  prnt %p ]", t.idx, strValue, hasWinner, t.winner)
+}
+
+// TournamentTree: a k-way merge algorithm using a tournament tree
+type TournamentTree[T any] struct {
+	tree           []TournamentNode[T]
+	comparatorFunc func(a, b T) int
+}
+
+func NewTournamentTree[T any](comparatorFunc func(a, b T) int) *TournamentTree[T] {
+	return &TournamentTree[T]{tree: nil, comparatorFunc: comparatorFunc}
+}
+
+// VeryFirstTournament initializes the tournament tree with the given contestants.
+func (t *TournamentTree[T]) VeryFirstTournament(contestants []*T) {
+	// passes the winners and bulds the users, every node touches once
+	// contestants are the leaves of the tree
+	// build the tree from the leaves to the root
+	// each node stores the index of the looser and its value
+	// if a node is a sentinel, it means it has no value
+	k := len(contestants)
+	if k == 0 {
+		return
+	}
+	d := 1
+	levels := 0
+	for d < k {
+		d *= 2
+		levels++
+	}
+	len := 2 * d // 1 based index, 0 is unused
+	t.tree = make([]TournamentNode[T], len)
+	for idx, value := range contestants {
+		t.tree[d+idx].value = value
+		t.tree[d+idx].idx = d + idx
+		t.tree[d+idx].winner = &t.tree[d+idx]
+	}
+	// build the tree
+	for level := levels - 1; level >= 0; level-- {
+		start := 1 << level
+		end := (1 << (level + 1)) - 1
+		for i := start; i <= end; i++ {
+			leftChild := t.tree[2*i]
+			rightChild := t.tree[2*i+1]
+			// at very start both children can be sentinels
+			if leftChild.winner == nil && rightChild.winner == nil {
+				// both children are sentinels
+				t.tree[i].winner = nil
+				t.tree[i].idx = -1 // store left child index
+				t.tree[i].value = nil
+				continue
+			}
+			// one child is a sentinel
+			if leftChild.winner == nil && rightChild.winner != nil {
+				// right child wins
+				t.tree[i].winner = rightChild.winner
+				t.tree[i].idx = -1
+				t.tree[i].value = nil
+				continue
+			}
+			if leftChild.winner != nil && rightChild.winner == nil {
+				// left child wins
+				t.tree[i].winner = leftChild.winner
+				t.tree[i].idx = -1
+				t.tree[i].value = nil
+				continue
+			}
+			// both children have values
+			if leftChild.winner.value == nil {
+				t.tree[i].winner = &rightChild
+				t.tree[i].idx = leftChild.idx
+				t.tree[i].value = nil
+				continue
+			}
+			if rightChild.winner.value == nil {
+				t.tree[i].winner = &leftChild
+				t.tree[i].idx = rightChild.idx
+				t.tree[i].value = nil
+				continue
+			}
+			left := *leftChild.winner.value
+			right := *rightChild.winner.value
+			// wrestle
+			if t.comparatorFunc(left, right) <= 0 {
+				t.tree[i].winner = leftChild.winner
+				t.tree[i].idx = rightChild.winner.idx // store looser index
+				t.tree[i].value = rightChild.winner.value
+			} else {
+				t.tree[i].winner = rightChild.winner
+				t.tree[i].idx = leftChild.winner.idx
+				t.tree[i].value = leftChild.winner.value
+			}
+		}
+	}
+}
+
+// Winner returns the current winner of the tournament
+func (t *TournamentTree[T]) Winner() (winner *TournamentNode[T], ok bool) {
+	if len(t.tree) == 0 {
+		return nil, false
+	}
+	if t.tree[1].winner.value == nil {
+		return nil, false
+	}
+	return t.tree[1].winner, true
+}
+
+// Challenge updates the tournament tree with a new challenger
+func (t *TournamentTree[T]) Challenge(challenger *TournamentNode[T]) {
+	// get the leaf node at index  at update its looser value
+	index := challenger.idx
+	currentChallenger := challenger
+	pIdx := index / 2
+	for pIdx >= 1 {
+		parent := &t.tree[pIdx]
+		if parent.value == nil {
+			// parent looser is sentinel then challenger wins automatically
+			parent.winner = currentChallenger
+			pIdx /= 2
+			currentChallenger = parent.winner
+			continue
+		}
+		if currentChallenger.value == nil {
+			parent.winner = &t.tree[parent.idx]
+			parent.idx = currentChallenger.idx
+			parent.value = nil
+			pIdx /= 2
+			currentChallenger = parent.winner
+			continue
+		}
+		parentLooserValue := *parent.value
+		challengerValue := *currentChallenger.value
+		if t.comparatorFunc(parentLooserValue, challengerValue) <= 0 {
+			// parent looser wins
+			parent.winner = &t.tree[parent.idx]
+			parent.idx = currentChallenger.idx
+			parent.value = currentChallenger.value
+
+		} else {
+			parent.winner = currentChallenger
+		}
+		pIdx /= 2
+		currentChallenger = parent.winner
+	}
+
 }
