@@ -17,7 +17,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/daniarleagk/paloo_db/io"
 )
@@ -49,6 +48,8 @@ type MergeFunc[T any] func(sequences []iter.Seq[io.RecordWithError[T]], comparat
 // It uses a combination of in-memory sorting and external sorting techniques to achieve this.
 // currently, we will implement a simple sorting with comparator on deserialized items
 // TODO: implement also comparators based on serialized items to avoid deserialization overhead
+// TODO: if data can fully fit into memory, we can use in-memory sorting algorithms, fall back to external sorting otherwise
+// TODO: since we process data in chunks and temp files are block oriented, we could also think about parallelizing flushing to disk and reading from disk
 type Sorter[T any] struct {
 	comparatorFunc        func(a, b T) int
 	getByteSize           func(item T) int
@@ -139,14 +140,11 @@ func (s *Sorter[T]) Sort(input iter.Seq[T]) (iter.Seq[io.RecordWithError[T]], er
 		for i := 0; i < len(files); i += s.kWayMergeSize {
 			end := min(i+s.kWayMergeSize, len(files))
 			batch := files[i:end]
-			start := time.Now()
 			mergeSeq, err := s.mergeFiles(batch)
 			if err != nil {
 				return nil, fmt.Errorf("failed to merge files: %v", err)
 			}
 			err = s.flushMergeSequence(mergeSeq, s.currentMergeRound, i)
-			duration := time.Since(start)
-			fmt.Printf("Sort merge %s %d %d %d \n", duration, s.currentMergeRound, i, end)
 			if err != nil {
 				return nil, fmt.Errorf("failed to flush merge sequence: %v", err)
 			}
@@ -358,7 +356,6 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 		chunksChan := make(chan []T, g.parallelism)
 		defer close(errorsChan)
 		chunkSize := (len(g.sliceBuffer) + g.parallelism - 1) / g.parallelism
-		start := time.Now()
 		for i := 0; i < g.parallelism; i++ {
 			wg.Add(1)
 			go func(index int) {
@@ -383,8 +380,6 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 			return err
 		default:
 		}
-		duration := time.Since(start)
-		fmt.Printf("Parallel sort duration: %s, number of items: %d, chunk size: %d\n", duration, len(g.sliceBuffer), chunkSize)
 		// Close the chunks channel to signal that no more chunks will be sent
 		// This is safe to do here because all goroutines have completed
 		// and no more chunks will be sent
@@ -414,10 +409,7 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 		}
 	} else {
 		// Sort the entire sliceBuffer
-		start := time.Now()
 		slices.SortFunc(g.sliceBuffer, g.comparatorFunc)
-		duration := time.Since(start)
-		fmt.Printf("In-memory sort duration: %s, number of items: %d\n", duration, len(g.sliceBuffer))
 		// Create a sequence from the sorted sliceBuffer
 		sortedSeq = func(yield func(io.RecordWithError[T]) bool) {
 			for _, item := range g.sliceBuffer {
@@ -433,7 +425,6 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	}
 	defer tmpFile.Close()
 	writer := g.tempFileWriterFactory.CreateTempFileWriter(tmpFile, g.bufferSize, g.serialize)
-	start := time.Now()
 	if err := writer.WriteSeq(func(yield func(T) bool) {
 		for r := range sortedSeq {
 			if r.Error != nil {
@@ -447,10 +438,57 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	}); err != nil {
 		return fmt.Errorf("failed to write merged sequence to temporary file: %v", err)
 	}
-	duration := time.Since(start)
-	fmt.Printf("Flush to disk duration: %s, number of items: %d\n", duration, len(g.sliceBuffer))
 	return nil
 }
+
+/* func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
+	// sort the sliceBuffer using the comparatorFunc
+	// write the sorted data to a temporary file using the tempFileWriterFactory
+	// current length of the sliceBuffer
+	// current plan not to use errgroup
+	// change in the future if needed
+	var wg sync.WaitGroup
+	errorsChan := make(chan error, g.parallelism)
+	defer close(errorsChan)
+	chunkSize := (len(g.sliceBuffer) + g.parallelism - 1) / g.parallelism
+	for i := 0; i < g.parallelism; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			// Create a temporary file for this chunk
+			tmpFile, err := g.createTmpFile(currentRunIndex, index)
+			if err != nil {
+				errorsChan <- fmt.Errorf("failed to create temporary file: %v", err)
+				return
+			}
+			defer tmpFile.Close()
+			start := i * chunkSize
+			if start >= len(g.sliceBuffer) {
+				// no more data to process
+				return
+			}
+			end := min((i+1)*chunkSize, len(g.sliceBuffer))
+			part := g.sliceBuffer[start:end]
+			// Sort the chunk
+			slices.SortFunc(part, g.comparatorFunc)
+			// Write the sorted chunk to the temporary file
+			writer := g.tempFileWriterFactory.CreateTempFileWriter(tmpFile, g.bufferSize, g.serialize)
+			if err := writer.WriteSeq(slices.Values(part)); err != nil {
+				errorsChan <- fmt.Errorf("failed to write chunk to file: %v", err)
+				return
+			}
+		}(i)
+	}
+	wg.Wait()
+	// Check for any errors
+	select {
+	case err := <-errorsChan:
+		return err
+	default:
+	}
+	return nil
+}
+*/
 
 // MergeHeapFunc has the type of MergeFunc that uses a min-heap to merge sorted sequences.
 // It takes a slice of sorted sequences and a comparator function, and returns a single merged sequence.
