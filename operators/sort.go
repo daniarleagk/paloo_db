@@ -7,7 +7,7 @@ package operators
 // TODO: provide abstraction to run generating and merging in parallel
 // the main sorter should be flexible enough to allow different strategies for run generation and merging
 // e.g. multi-threaded, single-threaded, replacement-selection, radix,... etc.
-
+// We are still using standard range iterators mostly iter.Seq and iter.Seq2 with error handling
 import (
 	"container/heap"
 	"fmt"
@@ -40,7 +40,7 @@ type RunGenerator[T any] interface {
 	GenerateRuns(input iter.Seq[T]) error
 }
 
-type MergeFunc[T any] func(sequences []iter.Seq[io.RecordWithError[T]], comparatorFunc func(a, b T) int) (iter.Seq[io.RecordWithError[T]], error)
+type MergeFunc[T any] func(sequences []iter.Seq2[T, error], comparatorFunc func(a, b T) int) (iter.Seq2[T, error], error)
 
 // Sorter is a generic external sorter that can sort large datasets that do not fit into memory.
 // main task is to orchestrate the sorting process by generating sorted runs and merging them.
@@ -106,7 +106,7 @@ func NewSorter[T any](
 	}
 }
 
-func (s *Sorter[T]) Sort(input iter.Seq[T]) (iter.Seq[io.RecordWithError[T]], error) {
+func (s *Sorter[T]) Sort(input iter.Seq[T]) (iter.Seq2[T, error], error) {
 	if input == nil {
 		return nil, fmt.Errorf("input iterator is nil")
 	}
@@ -162,7 +162,7 @@ func (s *Sorter[T]) Sort(input iter.Seq[T]) (iter.Seq[io.RecordWithError[T]], er
 	return s.mergeFiles(files)
 }
 
-func (s *Sorter[T]) mergeFiles(files []string) (iter.Seq[io.RecordWithError[T]], error) {
+func (s *Sorter[T]) mergeFiles(files []string) (iter.Seq2[T, error], error) {
 	if len(files) == 0 {
 		return nil, fmt.Errorf("no files to merge")
 	}
@@ -174,7 +174,7 @@ func (s *Sorter[T]) mergeFiles(files []string) (iter.Seq[io.RecordWithError[T]],
 		reader := s.tempFileReaderFactory.CreateTempFileReader(file, s.readBufferSize, s.deserialize)
 		return reader.All(), nil
 	}
-	slicesOfSeq := make([]iter.Seq[io.RecordWithError[T]], 0, len(files))
+	slicesOfSeq := make([]iter.Seq2[T, error], 0, len(files))
 	for _, fileName := range files {
 		file, err := s.openFile(fileName)
 		if err != nil {
@@ -204,7 +204,7 @@ func (s *Sorter[T]) getFilesToMerge(isRun bool, level int) ([]string, error) {
 	return files, nil
 }
 
-func (s *Sorter[T]) flushMergeSequence(mergeSeq iter.Seq[io.RecordWithError[T]], currentMergeRound int, index int) error {
+func (s *Sorter[T]) flushMergeSequence(mergeSeq iter.Seq2[T, error], currentMergeRound int, index int) error {
 	// create a new temporary file for the merged output
 	// realistically index is 6 decimal digits
 	fileName := fmt.Sprintf("%s/%s_%s_%d_%06d.%s", s.directoryPath, s.filePrefix, s.mergeStr, currentMergeRound, index, s.fileExtension)
@@ -217,12 +217,12 @@ func (s *Sorter[T]) flushMergeSequence(mergeSeq iter.Seq[io.RecordWithError[T]],
 	writer := s.tempFileWriterFactory.CreateTempFileWriter(file, s.writeBufferSize, s.serialize)
 	defer writer.Close()
 	err = writer.WriteSeq(func(yield func(T) bool) {
-		for r := range mergeSeq {
-			if r.Error != nil {
+		for r, err := range mergeSeq {
+			if err != nil {
 				// stop on error
 				return
 			}
-			if !yield(r.Record) {
+			if !yield(r) {
 				return
 			}
 		}
@@ -348,7 +348,7 @@ func (g *GoSortRunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
 func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	// current plan not to use errgroup
 	// change in the future if needed
-	var sortedSeq iter.Seq[io.RecordWithError[T]]
+	var sortedSeq iter.Seq2[T, error]
 	var err error
 	if g.parallelism > 1 {
 		var wg sync.WaitGroup
@@ -384,11 +384,11 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 		// This is safe to do here because all goroutines have completed
 		// and no more chunks will be sent
 		// get all chunks from the channel
-		chunks := make([]iter.Seq[io.RecordWithError[T]], 0, g.parallelism)
-		mapToRecordWithError := func(seq iter.Seq[T]) iter.Seq[io.RecordWithError[T]] {
-			return func(yield func(io.RecordWithError[T]) bool) {
+		chunks := make([]iter.Seq2[T, error], 0, g.parallelism)
+		mapToRecordWithError := func(seq iter.Seq[T]) iter.Seq2[T, error] {
+			return func(yield func(T, error) bool) {
 				for item := range seq {
-					if !yield(io.RecordWithError[T]{Record: item, Error: nil}) {
+					if !yield(item, nil) {
 						break
 					}
 				}
@@ -411,9 +411,9 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 		// Sort the entire sliceBuffer
 		slices.SortFunc(g.sliceBuffer, g.comparatorFunc)
 		// Create a sequence from the sorted sliceBuffer
-		sortedSeq = func(yield func(io.RecordWithError[T]) bool) {
+		sortedSeq = func(yield func(T, error) bool) {
 			for _, item := range g.sliceBuffer {
-				if !yield(io.RecordWithError[T]{Record: item, Error: nil}) {
+				if !yield(item, nil) {
 					break
 				}
 			}
@@ -426,12 +426,12 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	defer tmpFile.Close()
 	writer := g.tempFileWriterFactory.CreateTempFileWriter(tmpFile, g.bufferSize, g.serialize)
 	if err := writer.WriteSeq(func(yield func(T) bool) {
-		for r := range sortedSeq {
-			if r.Error != nil {
+		for r, err := range sortedSeq {
+			if err != nil {
 				// stop on error
 				return
 			}
-			if !yield(r.Record) {
+			if !yield(r) {
 				break
 			}
 		}
@@ -493,7 +493,7 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 // MergeHeapFunc has the type of MergeFunc that uses a min-heap to merge sorted sequences.
 // It takes a slice of sorted sequences and a comparator function, and returns a single merged sequence.
 // It returns an error if any of the input sequences yield an error.
-func MergeHeapFunc[T any](sequences []iter.Seq[io.RecordWithError[T]], comparatorFunc func(a, b T) int) (iter.Seq[io.RecordWithError[T]], error) {
+func MergeHeapFunc[T any](sequences []iter.Seq2[T, error], comparatorFunc func(a, b T) int) (iter.Seq2[T, error], error) {
 	// create heap
 	heapCompare := func(a, b PullIterRecordPair[T]) int {
 		return comparatorFunc(a.record, b.record)
@@ -507,37 +507,38 @@ func MergeHeapFunc[T any](sequences []iter.Seq[io.RecordWithError[T]], comparato
 	// Implement merging logic here
 	for _, s := range sequences {
 		// pull the first item from each sequence
-		next, stop := iter.Pull(s)
-		r, ok := next()
+		next, stop := iter.Pull2(s)
+		r, err, ok := next()
 		if !ok {
 			continue
 		}
-		if r.Error != nil {
-			return nil, r.Error
+		if err != nil {
+			return nil, err
 		}
-		pair := PullIterRecordPair[T]{record: r.Record, next: next, stop: stop}
+		pair := PullIterRecordPair[T]{record: r, next: next, stop: stop}
 		heap.Push(mergeHeap, pair)
 	}
 	// repeatedly pull the smallest item from the heap and push the next item from the same sequence
 	// until all sequences are exhausted
 	// return an iterator that yields the merged items
-	return func(yield func(io.RecordWithError[T]) bool) {
+	return func(yield func(T, error) bool) {
 		for mergeHeap.Len() > 0 {
 			// pull the smallest item from the heap
 			item := heap.Pop(mergeHeap).(PullIterRecordPair[T])
 			// yield the item
-			if !yield(io.RecordWithError[T]{Record: item.record}) {
+			if !yield(item.record, nil) {
 				return
 			}
 			// push the next item from the same sequence
 			next, stop := item.next, item.stop
-			if r, ok := next(); ok {
-				if r.Error != nil {
+			if r, err, ok := next(); ok {
+				if err != nil {
 					// stop the iteration on error
+					// TODO: should I push error and Zero?
 					stop()
 					return
 				}
-				pair := PullIterRecordPair[T]{record: r.Record, next: next, stop: stop}
+				pair := PullIterRecordPair[T]{record: r, next: next, stop: stop}
 				heap.Push(mergeHeap, pair)
 			} else {
 				stop()
@@ -549,7 +550,7 @@ func MergeHeapFunc[T any](sequences []iter.Seq[io.RecordWithError[T]], comparato
 // PullIterRecordPair is a helper struct to hold the current record and the next function of an iterator
 type PullIterRecordPair[T any] struct {
 	record T
-	next   func() (io.RecordWithError[T], bool)
+	next   func() (T, error, bool)
 	stop   func()
 }
 
@@ -584,26 +585,27 @@ func (h *MergeHeap[T]) Pop() any {
 	return x
 }
 
-func MergeTournamentFunc[T any](sequences []iter.Seq[io.RecordWithError[T]], comparatorFunc func(a, b T) int) (iter.Seq[io.RecordWithError[T]], error) {
+// MergeTournamentFunc has the type of MergeFunc that uses a tournament tree to merge sorted sequences.
+func MergeTournamentFunc[T any](sequences []iter.Seq2[T, error], comparatorFunc func(a, b T) int) (iter.Seq2[T, error], error) {
 	// create tournament tree
 	tournament := NewTournamentTree(func(a, b PullIterRecordPair[T]) int {
 		return comparatorFunc(a.record, b.record)
 	})
 	contestents := make([]*PullIterRecordPair[T], len(sequences))
 	for i, s := range sequences {
-		next, stop := iter.Pull(s)
-		r, ok := next()
+		next, stop := iter.Pull2(s)
+		r, err, ok := next()
 		if !ok {
 			contestents[i] = nil // sentinel
 			continue
 		}
-		if r.Error != nil {
-			return nil, r.Error
+		if err != nil {
+			return nil, err
 		}
-		contestents[i] = &PullIterRecordPair[T]{record: r.Record, next: next, stop: stop}
+		contestents[i] = &PullIterRecordPair[T]{record: r, next: next, stop: stop}
 	}
 	tournament.VeryFirstTournament(contestents)
-	return func(yield func(io.RecordWithError[T]) bool) {
+	return func(yield func(T, error) bool) {
 		// repeatedly pull the smallest item from the tournament tree
 		for {
 			winner, ok := tournament.Winner()
@@ -612,11 +614,17 @@ func MergeTournamentFunc[T any](sequences []iter.Seq[io.RecordWithError[T]], com
 				return
 			}
 			winnerValue := winner.value
-			yieldRecord := io.RecordWithError[T]{Record: winnerValue.record}
-			if !yield(yieldRecord) {
+			if !yield(winnerValue.record, nil) {
 				return
 			}
-			nextRecord, ok := winnerValue.next()
+			nextRecord, err, ok := winnerValue.next()
+			if err != nil {
+				// stop the iteration on error
+				// TODO: should I push error and Zero?
+				yield(*new(T), err)
+				winnerValue.stop()
+				return
+			}
 			if !ok {
 				// source exhausted
 				winner.value = nil
@@ -626,7 +634,7 @@ func MergeTournamentFunc[T any](sequences []iter.Seq[io.RecordWithError[T]], com
 				winnerValue.stop()
 				continue
 			}
-			winnerValue.record = nextRecord.Record
+			winnerValue.record = nextRecord
 			tournament.Challenge(winner)
 		}
 	}, nil

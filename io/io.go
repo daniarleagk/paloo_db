@@ -17,6 +17,7 @@ import (
 
 const TempFileSuffix string = "tmp"
 
+// DbObjectId is an interface for database object identifiers
 type DbObjectId interface {
 	comparable
 	StorageId() string // returns storage id
@@ -30,6 +31,15 @@ type Storage[I comparable, O any] interface {
 	Write(id I, b O) error // write object by id
 	Delete(id I) error     // delete object by id
 	Close() error
+}
+
+// Block interface for block oriented storage
+type Block interface {
+	Append(data []byte) bool // appends data to the block, returns false if not enough space
+	ToByteArray() []byte     // returns the block as byte array
+	All() iter.Seq[[]byte]   // returns a function that yields all records in the block
+	Reset() error            // resets the block
+	Bootstrap()              // initializes the block from the byte array
 }
 
 // PageId is a simple tuple of string and int64
@@ -229,12 +239,6 @@ func (s *SequenceBlockSingleFileStorage) Close() error {
 	return nil
 }
 
-// RecordWithError wraps a record with an error
-type RecordWithError[T any] struct {
-	Record T
-	Error  error
-}
-
 // TempFileWriter interface for writing temporary files
 type TempFileWriter[T any] interface {
 	WriteSeq(recordSeq iter.Seq[T]) error
@@ -244,16 +248,16 @@ type TempFileWriter[T any] interface {
 
 // TempFileReader interface for reading temporary files
 type TempFileReader[T any] interface {
-	All() iter.Seq[RecordWithError[T]]
+	All() iter.Seq2[T, error]
 	Close() error
 }
 
-// FixedSizeTempFileWriter simple wrapper temp file writer streamed and buffered
+// BlockTempFileWriter simple wrapper temp file writer streamed and buffered
 // assumption is that record fits into block/buffer
 // FIXME do we really need a buffered writer
 // FIXME we could also think about using a direct write approach
 // FIXME maybe also consider double buffer and go routine to flush
-type FixedSizeTempFileWriter[T any] struct {
+type BlockTempFileWriter[T any] struct {
 	file        *os.File
 	bufferSize  int
 	serialize   func(item T, buf []byte) error
@@ -261,17 +265,17 @@ type FixedSizeTempFileWriter[T any] struct {
 	recordSize  int
 }
 
-func NewFixedSizeTempFileWriter[T any](file *os.File, bufferSize int, recordSize int, serialize func(item T, buf []byte) error) *FixedSizeTempFileWriter[T] {
-	return &FixedSizeTempFileWriter[T]{
+func NewFixedSizeTempFileWriter[T any](file *os.File, bufferSize int, recordSize int, serialize func(item T, buf []byte) error) *BlockTempFileWriter[T] {
+	return &BlockTempFileWriter[T]{
 		file:        file,
 		bufferSize:  bufferSize,
 		serialize:   serialize,
-		bufferBlock: *NewFixedSizeRecordBlock(bufferSize, recordSize),
+		bufferBlock: NewFixedSizeRecordBlock(bufferSize, recordSize),
 		recordSize:  recordSize,
 	}
 }
 
-func (w *FixedSizeTempFileWriter[T]) WriteSeq(recordSeq iter.Seq[T]) error {
+func (w *BlockTempFileWriter[T]) WriteSeq(recordSeq iter.Seq[T]) error {
 	buf := make([]byte, w.recordSize) // allocate buffer
 	for record := range recordSeq {
 		err := w.serialize(record, buf)
@@ -297,14 +301,14 @@ func (w *FixedSizeTempFileWriter[T]) WriteSeq(recordSeq iter.Seq[T]) error {
 	return nil
 }
 
-func (w *FixedSizeTempFileWriter[T]) Flush() error {
+func (w *BlockTempFileWriter[T]) Flush() error {
 	// currently don´t use fsync
 	// FIXME for WAL writer
 	_, err := w.file.Write(w.bufferBlock.ToByteArray())
 	return err
 }
 
-func (w *FixedSizeTempFileWriter[T]) Close() error {
+func (w *BlockTempFileWriter[T]) Close() error {
 	// flush remaining data
 	if err := w.Flush(); err != nil {
 		return err
@@ -325,14 +329,14 @@ func NewFixedSizeTempFileReader[T any](file *os.File, bufferSize int, recordSize
 	return &FixedSizeTempFileReader[T]{
 		file:        file,
 		bufferSize:  bufferSize,
-		bufferBlock: *NewFixedSizeRecordBlock(bufferSize, recordSize),
+		bufferBlock: NewFixedSizeRecordBlock(bufferSize, recordSize),
 		recordSize:  recordSize,
 		deserialize: deserialize,
 	}
 }
 
-func (r *FixedSizeTempFileReader[T]) All() iter.Seq[RecordWithError[T]] {
-	f := func(yield func(RecordWithError[T]) bool) {
+func (r *FixedSizeTempFileReader[T]) All() iter.Seq2[T, error] {
+	f := func(yield func(T, error) bool) {
 	outerLoop:
 		for {
 			_, err := r.file.Read(r.bufferBlock.data) // initial read
@@ -341,17 +345,17 @@ func (r *FixedSizeTempFileReader[T]) All() iter.Seq[RecordWithError[T]] {
 				break
 			}
 			if err != nil {
-				yield(RecordWithError[T]{Error: err})
+				yield(utils.Zero[T](), err)
 				break
 			}
 			r.bufferBlock.Bootstrap()
 			for bSlice := range r.bufferBlock.All() {
 				record, err := r.deserialize(bSlice)
 				if err != nil {
-					yield(RecordWithError[T]{Error: err})
+					yield(utils.Zero[T](), err)
 					break outerLoop
 				}
-				if !yield(RecordWithError[T]{Record: record, Error: nil}) {
+				if !yield(record, nil) {
 					break outerLoop
 				}
 			}
@@ -373,16 +377,18 @@ type FixedSizeRecordBlock struct {
 	numRecords     uint32
 	currentOffset  uint32
 	recordByteSize uint32
+	currentIndex   uint32 // for iterator
 }
 
 // Default Constructor
-func NewFixedSizeRecordBlock(blockSize int, recordByteSize int) *FixedSizeRecordBlock {
-	return &FixedSizeRecordBlock{
+func NewFixedSizeRecordBlock(blockSize int, recordByteSize int) FixedSizeRecordBlock {
+	return FixedSizeRecordBlock{
 		data:           make([]byte, blockSize),
 		numRecords:     0,
 		blockSize:      uint32(blockSize),
 		recordByteSize: uint32(recordByteSize),
 		currentOffset:  12, // first 12 bytes are reserved for numRecords, currentOffset and recordByteSize
+		currentIndex:   0,
 	}
 }
 
@@ -400,7 +406,7 @@ func (rb *FixedSizeRecordBlock) Append(data []byte) bool {
 }
 
 // returns data with first bytes the
-func (rb FixedSizeRecordBlock) ToByteArray() []byte {
+func (rb *FixedSizeRecordBlock) ToByteArray() []byte {
 	binary.BigEndian.PutUint32(rb.data[:4], rb.numRecords)
 	binary.BigEndian.PutUint32(rb.data[4:8], rb.currentOffset)
 	binary.BigEndian.PutUint32(rb.data[8:12], rb.recordByteSize)
@@ -415,14 +421,13 @@ func (rb *FixedSizeRecordBlock) FromByteArray(d []byte) {
 	copy(d[12:], rb.data)
 }
 
-// Bootstrap initializes the block with values from its internal data array
 func (rb *FixedSizeRecordBlock) Bootstrap() {
 	rb.numRecords = binary.BigEndian.Uint32(rb.data[:4])
 	rb.currentOffset = binary.BigEndian.Uint32(rb.data[4:8])
 	rb.recordByteSize = binary.BigEndian.Uint32(rb.data[8:12])
 }
 
-func (rb FixedSizeRecordBlock) All() func(yield func([]byte) bool) {
+func (rb *FixedSizeRecordBlock) All() iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
 		offset := 12
 		for range int(rb.numRecords) {
@@ -434,6 +439,15 @@ func (rb FixedSizeRecordBlock) All() func(yield func([]byte) bool) {
 	}
 }
 
+func (rb *FixedSizeRecordBlock) Next() ([]byte, bool, error) {
+	if rb.currentIndex < rb.numRecords {
+		offset := 12 + rb.currentIndex*rb.recordByteSize
+		rb.currentIndex++
+		return rb.data[offset : offset+rb.recordByteSize], true, nil
+	}
+	return nil, false, nil
+}
+
 func (rb *FixedSizeRecordBlock) Reset() error {
 	rb.numRecords = 0
 	rb.currentOffset = 12
@@ -443,4 +457,39 @@ func (rb *FixedSizeRecordBlock) Reset() error {
 func (rb *FixedSizeRecordBlock) String() string {
 	return fmt.Sprintf("FixedSizeRecordBlock{numRecords: %d, currentOffset: %d, recordByteSize: %d}",
 		rb.numRecords, rb.currentOffset, rb.recordByteSize)
+}
+
+// VarLenRecordBlock is a block of variable-length records as internal storage helper.
+// used e.g. for tempfiles while sorting
+// first 8 bytes are reserved for blockSize (4 bytes) and currentOffset (4 bytes)
+// max record size is 65535 bytes (2 bytes for length prefix) 65KB
+type VarLenRecordBlock struct {
+	data          []byte
+	blockSize     uint32
+	currentOffset uint32
+}
+
+func NewVarLenRecordBlock(blockSize int) *VarLenRecordBlock {
+	return &VarLenRecordBlock{
+		data:          make([]byte, blockSize),
+		blockSize:     uint32(blockSize),
+		currentOffset: 8, // first 8 bytes are reserved for blockSize and currentOffset
+	}
+}
+
+// append now writes length prefixed data into the block
+// for length we use 2 bytes uint16
+func (rb *VarLenRecordBlock) Append(data []byte) bool {
+	dataLen := uint32(len(data))
+	//no space
+	if rb.currentOffset+dataLen+2 > rb.blockSize {
+		return false
+	}
+	// write length prefix
+	binary.BigEndian.PutUint16(rb.data[rb.currentOffset:], uint16(dataLen))
+	rb.currentOffset += 2
+	// write data
+	copy(rb.data[rb.currentOffset:], data)
+	rb.currentOffset += dataLen
+	return true
 }

@@ -113,16 +113,16 @@ func TestGoSortRunGenerator(t *testing.T) {
 		reader := io.NewFixedSizeTempFileReader(f, 64, 4, deserialize)
 		t.Logf("Reading file: %s", file)
 		previous := int32(-1)
-		for r := range reader.All() { // just to ensure we can read all records
-			if r.Error != nil {
-				t.Errorf("read failed: %v", r.Error)
+		for r, err := range reader.All() { // just to ensure we can read all records
+			if err != nil {
+				t.Errorf("read failed: %v", err)
 			}
 			count++
 			// check ordering
-			if r.Record < previous {
-				t.Errorf("expected %d, but got %d", previous+1, r.Record)
+			if r < previous {
+				t.Errorf("expected %d, but got %d", previous+1, r)
 			}
-			previous = r.Record
+			previous = r
 		}
 		f.Close()
 	}
@@ -144,9 +144,19 @@ func Map[T any, U any](input iter.Seq[T], mapFunc func(T) U) iter.Seq[U] {
 	}
 }
 
+func Map2[T any, U any](input iter.Seq[T], mapFunc func(T) U) iter.Seq2[U, error] {
+	return func(yield func(U, error) bool) {
+		for item := range input {
+			if !yield(mapFunc(item), nil) {
+				break
+			}
+		}
+	}
+}
+
 func TestKWayMerger(t *testing.T) {
 	k := 5
-	sequences := make([]iter.Seq[io.RecordWithError[int32]], 0)
+	sequences := make([]iter.Seq2[int32, error], 0)
 	allCount := 0
 	slice := make([]int32, 0)
 	numElements := 53
@@ -163,8 +173,8 @@ func TestKWayMerger(t *testing.T) {
 		}
 		subSlice := slice[start:end]
 		t.Log("Sequence", i, "from", start, "to", end, "size", len(subSlice), "contents:", subSlice)
-		mappedIt := Map(slices.Values(subSlice), func(v int32) io.RecordWithError[int32] {
-			return io.RecordWithError[int32]{Record: v, Error: nil}
+		mappedIt := Map2(slices.Values(subSlice), func(v int32) int32 {
+			return v
 		})
 		sequences = append(sequences, mappedIt)
 	}
@@ -177,12 +187,16 @@ func TestKWayMerger(t *testing.T) {
 	}
 	previous := int32(-1)
 	count := 0
-	for r := range mergedSeq {
-		if r.Record < previous {
+	for r, err := range mergedSeq {
+		if err != nil {
+			t.Errorf("failed to read merged sequence: %v", err)
+			continue
+		}
+		if r < previous {
 			t.Errorf("expected %d, but got %d", previous, r)
 		}
 		//t.Log("sorted record", r)
-		previous = r.Record
+		previous = r
 		count++
 	}
 	if count != allCount {
@@ -213,67 +227,67 @@ func initTestTournamentTree() (*TournamentTree[PullIterRecordPair[int]], []*Pull
 	a9 := []int{8, 19, 24, 29}
 	iterSlice := make([]*PullIterRecordPair[int], 0, k)
 	// 1
-	n1, s1 := iter.Pull(Map(slices.Values(a1), func(v int) io.RecordWithError[int] {
-		return io.RecordWithError[int]{Record: v, Error: nil}
+	n1, s1 := iter.Pull2(Map2(slices.Values(a1), func(v int) int {
+		return v
 	}))
-	r1, _ := n1()
-	p1 := PullIterRecordPair[int]{record: r1.Record, next: n1, stop: s1}
+	r1, _, _ := n1()
+	p1 := PullIterRecordPair[int]{record: r1, next: n1, stop: s1}
 	iterSlice = append(iterSlice, &p1)
 	// 2
-	n2, s2 := iter.Pull(Map(slices.Values(a2), func(v int) io.RecordWithError[int] {
-		return io.RecordWithError[int]{Record: v, Error: nil}
+	n2, s2 := iter.Pull2(Map2(slices.Values(a2), func(v int) int {
+		return v
 	}))
-	r2, _ := n2()
-	p2 := PullIterRecordPair[int]{record: r2.Record, next: n2, stop: s2}
+	r2, _, _ := n2()
+	p2 := PullIterRecordPair[int]{record: r2, next: n2, stop: s2}
 	iterSlice = append(iterSlice, &p2)
 	// 3
-	n3, s3 := iter.Pull(Map(slices.Values(a3), func(v int) io.RecordWithError[int] {
-		return io.RecordWithError[int]{Record: v, Error: nil}
+	n3, s3 := iter.Pull2(Map2(slices.Values(a3), func(v int) int {
+		return v
 	}))
-	r3, _ := n3()
-	p3 := PullIterRecordPair[int]{record: r3.Record, next: n3, stop: s3}
+	r3, _, _ := n3()
+	p3 := PullIterRecordPair[int]{record: r3, next: n3, stop: s3}
 	iterSlice = append(iterSlice, &p3)
 	// 4
-	n4, s4 := iter.Pull(Map(slices.Values(a4), func(v int) io.RecordWithError[int] {
-		return io.RecordWithError[int]{Record: v, Error: nil}
+	n4, s4 := iter.Pull2(Map2(slices.Values(a4), func(v int) int {
+		return v
 	}))
-	r4, _ := n4()
-	p4 := PullIterRecordPair[int]{record: r4.Record, next: n4, stop: s4}
+	r4, _, _ := n4()
+	p4 := PullIterRecordPair[int]{record: r4, next: n4, stop: s4}
 	iterSlice = append(iterSlice, &p4)
 	// 5
-	n5, s5 := iter.Pull(Map(slices.Values(a5), func(v int) io.RecordWithError[int] {
-		return io.RecordWithError[int]{Record: v, Error: nil}
+	n5, s5 := iter.Pull2(Map2(slices.Values(a5), func(v int) int {
+		return v
 	}))
-	r5, _ := n5()
-	p5 := PullIterRecordPair[int]{record: r5.Record, next: n5, stop: s5}
+	r5, _, _ := n5()
+	p5 := PullIterRecordPair[int]{record: r5, next: n5, stop: s5}
 	iterSlice = append(iterSlice, &p5)
 	// 6
-	n6, s6 := iter.Pull(Map(slices.Values(a6), func(v int) io.RecordWithError[int] {
-		return io.RecordWithError[int]{Record: v, Error: nil}
+	n6, s6 := iter.Pull2(Map2(slices.Values(a6), func(v int) int {
+		return v
 	}))
-	r6, _ := n6()
-	p6 := PullIterRecordPair[int]{record: r6.Record, next: n6, stop: s6}
+	r6, _, _ := n6()
+	p6 := PullIterRecordPair[int]{record: r6, next: n6, stop: s6}
 	iterSlice = append(iterSlice, &p6)
 	// 7
-	n7, s7 := iter.Pull(Map(slices.Values(a7), func(v int) io.RecordWithError[int] {
-		return io.RecordWithError[int]{Record: v, Error: nil}
+	n7, s7 := iter.Pull2(Map2(slices.Values(a7), func(v int) int {
+		return v
 	}))
-	r7, _ := n7()
-	p7 := PullIterRecordPair[int]{record: r7.Record, next: n7, stop: s7}
+	r7, _, _ := n7()
+	p7 := PullIterRecordPair[int]{record: r7, next: n7, stop: s7}
 	iterSlice = append(iterSlice, &p7)
 	// 8
-	n8, s8 := iter.Pull(Map(slices.Values(a8), func(v int) io.RecordWithError[int] {
-		return io.RecordWithError[int]{Record: v, Error: nil}
+	n8, s8 := iter.Pull2(Map2(slices.Values(a8), func(v int) int {
+		return v
 	}))
-	r8, _ := n8()
-	p8 := PullIterRecordPair[int]{record: r8.Record, next: n8, stop: s8}
+	r8, _, _ := n8()
+	p8 := PullIterRecordPair[int]{record: r8, next: n8, stop: s8}
 	iterSlice = append(iterSlice, &p8)
 	// 9
-	n9, s9 := iter.Pull(Map(slices.Values(a9), func(v int) io.RecordWithError[int] {
-		return io.RecordWithError[int]{Record: v, Error: nil}
+	n9, s9 := iter.Pull2(Map2(slices.Values(a9), func(v int) int {
+		return v
 	}))
-	r9, _ := n9()
-	p9 := PullIterRecordPair[int]{record: r9.Record, next: n9, stop: s9}
+	r9, _, _ := n9()
+	p9 := PullIterRecordPair[int]{record: r9, next: n9, stop: s9}
 	iterSlice = append(iterSlice, &p9)
 
 	tournament := NewTournamentTree(func(a, b PullIterRecordPair[int]) int {
@@ -293,14 +307,14 @@ func TestTournamentTreeBuild(t *testing.T) {
 			t.Fatalf("expected winner to be %d, but got %d", i+1, winner.value.record)
 		}
 		iteratorPair := winner.value
-		nextVal, ok := iteratorPair.next()
+		nextVal, _, ok := iteratorPair.next()
 		if !ok {
 			winner.value = nil
 			winner.winner = nil
 			tournament.Challenge(winner) // p2 is now 16
 			continue
 		}
-		iteratorPair.record = nextVal.Record
+		iteratorPair.record = nextVal
 		tournament.Challenge(winner) // p2 is now 16
 	}
 	for _, source := range sources {
@@ -315,7 +329,7 @@ func TestTournamentTreeBuild(t *testing.T) {
 
 func TestTournamentMerge(t *testing.T) {
 	k := 5
-	sequences := make([]iter.Seq[io.RecordWithError[int32]], 0)
+	sequences := make([]iter.Seq2[int32, error], 0)
 	allCount := 0
 	slice := make([]int32, 0)
 	numElements := 53
@@ -332,8 +346,8 @@ func TestTournamentMerge(t *testing.T) {
 		}
 		subSlice := slice[start:end]
 		t.Log("Sequence", i, "from", start, "to", end, "size", len(subSlice), "contents:", subSlice)
-		mappedIt := Map(slices.Values(subSlice), func(v int32) io.RecordWithError[int32] {
-			return io.RecordWithError[int32]{Record: v, Error: nil}
+		mappedIt := Map2(slices.Values(subSlice), func(v int32) int32 {
+			return v
 		})
 		sequences = append(sequences, mappedIt)
 	}
@@ -346,12 +360,16 @@ func TestTournamentMerge(t *testing.T) {
 	}
 	previous := int32(-1)
 	count := 0
-	for r := range mergedSeq {
-		if r.Record < previous {
+	for r, err := range mergedSeq {
+		if err != nil {
+			t.Errorf("failed to read record: %v", err)
+			continue
+		}
+		if r < previous {
 			t.Errorf("expected %d, but got %d", previous, r)
 		}
 		//t.Log("sorted record", r)
-		previous = r.Record
+		previous = r
 		count++
 	}
 	if count != allCount {
@@ -388,7 +406,7 @@ func TestSimpleInt64Sort(t *testing.T) {
 	kWay := 4
 	readBufferSize, writeBufferSize := 128, 128 // 12 bytes per page header 128 -12 = 116 bytes for data => 14 int64 per page
 	runSize := 512                              // 512 /8 = 64 int64 per run
-	runGenerator := NewGoSortRunGenerator[int64](
+	runGenerator := NewGoSortRunGenerator(
 		readBufferSize,
 		runSize,
 		512/8, // initial run size
@@ -417,14 +435,14 @@ func TestSimpleInt64Sort(t *testing.T) {
 	}
 	previous := int64(-1)
 	count := 0
-	for r := range sortedSeq {
-		if r.Error != nil {
-			t.Errorf("read failed: %v", r.Error)
+	for r, err := range sortedSeq {
+		if err != nil {
+			t.Errorf("read failed: %v", err)
 		}
-		if r.Record < previous {
-			t.Errorf("expected %d, but got %d", previous, r.Record)
+		if r < previous {
+			t.Errorf("expected %d, but got %d", previous, r)
 		}
-		previous = r.Record
+		previous = r
 		count++
 	}
 	if count != elementsCount {
@@ -435,7 +453,7 @@ func TestSimpleInt64Sort(t *testing.T) {
 
 func TestSimpleInt64SortLarge(t *testing.T) {
 
-	if strings.Contains(t.Name(), "Large") {
+	if strings.Contains(t.Name(), "large") {
 		t.Skip("Local run test only")
 	}
 
@@ -480,7 +498,7 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 			}
 			factoryReader := &FixedSizeTempFileReaderFactory[int64]{recordSize: 8}
 			factoryWriter := &FixedSizeTempFileWriterFactory[int64]{recordSize: 8}
-			parallelism := 1
+			parallelism := 8
 			kWay := 64                                            // memory is 128 KB * 100 at least
 			readBufferSize, writeBufferSize := 1024*256, 1024*256 // 256 KB
 			runSize := 1024 * 1024 * 16                           // 16 MB Buffer
@@ -518,14 +536,14 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 			previous := int64(-1)
 			count := 0
 			start = time.Now()
-			for r := range sortedSeq {
-				if r.Error != nil {
-					t.Errorf("read failed: %v", r.Error)
+			for r, err := range sortedSeq {
+				if err != nil {
+					t.Errorf("read failed: %v", err)
 				}
-				if r.Record < previous {
-					t.Errorf("expected %d, but got %d", previous, r.Record)
+				if r < previous {
+					t.Errorf("expected %d, but got %d", previous, r)
 				}
-				previous = r.Record
+				previous = r
 				count++
 			}
 			if count != elementsCount {

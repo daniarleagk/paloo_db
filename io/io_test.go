@@ -30,13 +30,6 @@ func setTestConfig(t *testing.T) *StorageConfig {
 	}
 }
 
-func tearDown(conf *StorageConfig) {
-	if _, err := os.Stat(conf.directory); err == nil {
-		//
-		os.RemoveAll(conf.directory)
-	}
-}
-
 func createByteSliceBlock(slice []int64) *Page {
 	block := &Page{}
 	data := make([]byte, 32)
@@ -246,7 +239,7 @@ func TestFixedSizeRecordWriterReader(t *testing.T) {
 	defer f.Close()
 	// Create a FixedSizeTempFileWriter
 	serialize := func(item int32, buf []byte) error {
-		binary.BigEndian.PutUint64(buf, uint64(item))
+		binary.BigEndian.PutUint32(buf, uint32(item))
 		return nil
 	}
 	// NOTE the header per buffer is 12 bytes
@@ -287,14 +280,14 @@ func TestFixedSizeRecordWriterReader(t *testing.T) {
 	allRecords := reader.All()
 	i := 0
 	shouldHaveData := false
-	for r := range allRecords {
-		if r.Error != nil {
-			t.Errorf("read failed: %v", r.Error)
+	for r, err := range allRecords {
+		if err != nil {
+			t.Errorf("read failed: %v", err)
 		}
-		if r.Record != int32(i) {
-			t.Errorf("expected record %d got %d", i, r.Record)
+		if r != int32(i) {
+			t.Errorf("expected record %d got %d", i, r)
 		}
-		t.Logf("Read record %d: %v", i, r.Record)
+		t.Logf("Read record %d: %v", i, r)
 		i++
 		shouldHaveData = true
 	}
