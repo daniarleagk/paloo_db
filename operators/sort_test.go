@@ -30,7 +30,7 @@ type FixedSizeTempFileReaderFactory[T any] struct {
 }
 
 func (f *FixedSizeTempFileReaderFactory[T]) CreateTempFileReader(file *os.File, bufferSize int, deserialize func(data []byte) (T, error)) io.TempFileReader[T] {
-	return io.NewFixedSizeTempFileReader(file, bufferSize, f.recordSize, deserialize)
+	return io.NewFixedLenTempFileReader(file, bufferSize, f.recordSize, deserialize)
 }
 
 func permutate[T any](slice []T) []T {
@@ -110,7 +110,7 @@ func TestGoSortRunGenerator(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to open file %s: %v", file, err)
 		}
-		reader := io.NewFixedSizeTempFileReader(f, 64, 4, deserialize)
+		reader := io.NewFixedLenTempFileReader(f, 64, 4, deserialize)
 		t.Logf("Reading file: %s", file)
 		previous := int32(-1)
 		for r, err := range reader.All() { // just to ensure we can read all records

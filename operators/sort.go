@@ -441,55 +441,6 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	return nil
 }
 
-/* func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
-	// sort the sliceBuffer using the comparatorFunc
-	// write the sorted data to a temporary file using the tempFileWriterFactory
-	// current length of the sliceBuffer
-	// current plan not to use errgroup
-	// change in the future if needed
-	var wg sync.WaitGroup
-	errorsChan := make(chan error, g.parallelism)
-	defer close(errorsChan)
-	chunkSize := (len(g.sliceBuffer) + g.parallelism - 1) / g.parallelism
-	for i := 0; i < g.parallelism; i++ {
-		wg.Add(1)
-		go func(index int) {
-			defer wg.Done()
-			// Create a temporary file for this chunk
-			tmpFile, err := g.createTmpFile(currentRunIndex, index)
-			if err != nil {
-				errorsChan <- fmt.Errorf("failed to create temporary file: %v", err)
-				return
-			}
-			defer tmpFile.Close()
-			start := i * chunkSize
-			if start >= len(g.sliceBuffer) {
-				// no more data to process
-				return
-			}
-			end := min((i+1)*chunkSize, len(g.sliceBuffer))
-			part := g.sliceBuffer[start:end]
-			// Sort the chunk
-			slices.SortFunc(part, g.comparatorFunc)
-			// Write the sorted chunk to the temporary file
-			writer := g.tempFileWriterFactory.CreateTempFileWriter(tmpFile, g.bufferSize, g.serialize)
-			if err := writer.WriteSeq(slices.Values(part)); err != nil {
-				errorsChan <- fmt.Errorf("failed to write chunk to file: %v", err)
-				return
-			}
-		}(i)
-	}
-	wg.Wait()
-	// Check for any errors
-	select {
-	case err := <-errorsChan:
-		return err
-	default:
-	}
-	return nil
-}
-*/
-
 // MergeHeapFunc has the type of MergeFunc that uses a min-heap to merge sorted sequences.
 // It takes a slice of sorted sequences and a comparator function, and returns a single merged sequence.
 // It returns an error if any of the input sequences yield an error.

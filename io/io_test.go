@@ -275,7 +275,7 @@ func TestFixedSizeRecordWriterReader(t *testing.T) {
 	// reset offset from a file handler
 	f.Seek(0, io.SeekStart)
 	// Create a FixedSizeTempFileReader
-	reader := NewFixedSizeTempFileReader(f, 64, 4, deserialize)
+	reader := NewFixedLenTempFileReader(f, 64, 4, deserialize)
 	// Read all records
 	allRecords := reader.All()
 	i := 0
