@@ -30,13 +30,6 @@ func setTestConfig(t *testing.T) *StorageConfig {
 	}
 }
 
-func tearDown(conf *StorageConfig) {
-	if _, err := os.Stat(conf.directory); err == nil {
-		//
-		os.RemoveAll(conf.directory)
-	}
-}
-
 func createByteSliceBlock(slice []int64) *Page {
 	block := &Page{}
 	data := make([]byte, 32)
@@ -236,6 +229,22 @@ func TestFixedSizeRecordBlock(t *testing.T) {
 	}
 }
 
+type Int32DeSerializer struct{}
+
+func (Int32DeSerializer) Serialize(item int32, buf []byte) error {
+	binary.BigEndian.PutUint32(buf, uint32(item))
+	return nil
+}
+
+func (Int32DeSerializer) Deserialize(data []byte) (int32, error) {
+	var record int32
+	buf := bytes.NewReader(data)
+	if err := binary.Read(buf, binary.BigEndian, &record); err != nil {
+		return 0, err
+	}
+	return record, nil
+}
+
 func TestFixedSizeRecordWriterReader(t *testing.T) {
 	tmpDir := t.TempDir()
 	fp := filepath.Join(tmpDir, "test.tmp")
@@ -245,16 +254,13 @@ func TestFixedSizeRecordWriterReader(t *testing.T) {
 	}
 	defer f.Close()
 	// Create a FixedSizeTempFileWriter
-	serialize := func(item int32, buf []byte) error {
-		binary.BigEndian.PutUint64(buf, uint64(item))
-		return nil
-	}
+	deSerialize := Int32DeSerializer{}
 	// NOTE the header per buffer is 12 bytes
 	// current capacity is 64 - 12 = 52
 	// each record is 4 bytes
 	// we should have 13 Records per buffer
 	recordsPerBuffer := 13
-	writer := NewFixedSizeTempFileWriter(f, 64, 4, serialize)
+	writer := NewFixedSizeTempFileWriter(f, 64, 4, deSerialize)
 	// now we will insert 4 buffers
 	// 3 full buffers and 1 partial buffer
 	// each buffer can hold 13 records
@@ -271,30 +277,22 @@ func TestFixedSizeRecordWriterReader(t *testing.T) {
 	if err := writer.Flush(); err != nil {
 		t.Errorf("flush failed: %v", err)
 	}
-	deserialize := func(data []byte) (int32, error) {
-		var record int32
-		buf := bytes.NewReader(data)
-		if err := binary.Read(buf, binary.BigEndian, &record); err != nil {
-			return 0, err
-		}
-		return record, nil
-	}
 	// reset offset from a file handler
 	f.Seek(0, io.SeekStart)
 	// Create a FixedSizeTempFileReader
-	reader := NewFixedSizeTempFileReader(f, 64, 4, deserialize)
+	reader := NewFixedLenTempFileReader(f, 64, 4, deSerialize)
 	// Read all records
 	allRecords := reader.All()
 	i := 0
 	shouldHaveData := false
-	for r := range allRecords {
-		if r.Error != nil {
-			t.Errorf("read failed: %v", r.Error)
+	for r, err := range allRecords {
+		if err != nil {
+			t.Errorf("read failed: %v", err)
 		}
-		if r.Record != int32(i) {
-			t.Errorf("expected record %d got %d", i, r.Record)
+		if r != int32(i) {
+			t.Errorf("expected record %d got %d", i, r)
 		}
-		t.Logf("Read record %d: %v", i, r.Record)
+		t.Logf("Read record %d: %v", i, r)
 		i++
 		shouldHaveData = true
 	}
