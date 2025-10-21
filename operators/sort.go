@@ -19,28 +19,24 @@ import (
 	"sync"
 
 	"github.com/daniarleagk/paloo_db/io"
+	"github.com/daniarleagk/paloo_db/utils"
 )
 
-type CreateTempFileWriterFactory[T any] interface {
-	CreateTempFileWriter(file *os.File, bufferSize int, serialize func(item T, buf []byte) error) io.TempFileWriter[T]
+// Merger is an interface for merging sorted sequences.
+type Merger[T any, C utils.Comparator[T]] interface {
+	Merge(sequences []iter.Seq2[T, error], comparatorFunc C) (iter.Seq2[T, error], error)
 }
 
-type CreateTempFileReaderFactory[T any] interface {
-	CreateTempFileReader(file *os.File, bufferSize int, deserialize func(data []byte) (T, error)) io.TempFileReader[T]
-}
-
-type RunGenerator[T any] interface {
-	Initialize(
-		comparatorFunc func(a, b T) int,
-		getByteSize func(item T) int,
-		serialize func(item T, buf []byte) error,
+// RunGenerator is an interface for generating sorted runs from an input sequence.
+type RunGenerator[T any, C utils.Comparator[T], U utils.GetByteSize[T], S utils.Serializer[T], M Merger[T, C]] interface {
+	GenerateRuns(input iter.Seq[T],
+		comparatorFunc C,
+		getByteSize U,
+		serialize S,
+		mergeFunc M,
 		createTmpFile func(currentRunIndex int, index int) (*os.File, error),
-		tempFileWriterFactory CreateTempFileWriterFactory[T],
 	) error
-	GenerateRuns(input iter.Seq[T]) error
 }
-
-type MergeFunc[T any] func(sequences []iter.Seq2[T, error], comparatorFunc func(a, b T) int) (iter.Seq2[T, error], error)
 
 // Sorter is a generic external sorter that can sort large datasets that do not fit into memory.
 // main task is to orchestrate the sorting process by generating sorted runs and merging them.
@@ -50,15 +46,15 @@ type MergeFunc[T any] func(sequences []iter.Seq2[T, error], comparatorFunc func(
 // TODO: implement also comparators based on serialized items to avoid deserialization overhead
 // TODO: if data can fully fit into memory, we can use in-memory sorting algorithms, fall back to external sorting otherwise
 // TODO: since we process data in chunks and temp files are block oriented, we could also think about parallelizing flushing to disk and reading from disk
-type Sorter[T any] struct {
-	comparatorFunc        func(a, b T) int
-	getByteSize           func(item T) int
-	serialize             func(item T, buf []byte) error
-	deserialize           func(data []byte) (T, error)
-	tempFileReaderFactory CreateTempFileReaderFactory[T]
-	tempFileWriterFactory CreateTempFileWriterFactory[T]
-	runGenerator          RunGenerator[T]
-	mergeFunc             MergeFunc[T]
+type Sorter[T any, C utils.Comparator[T], U utils.GetByteSize[T], S utils.Serializer[T], D utils.Deserializer[T], M Merger[T, C]] struct {
+	comparatorFunc        C
+	getByteSize           U
+	serialize             S
+	deserialize           D
+	mergeFunc             M
+	runGenerator          RunGenerator[T, C, U, S, M]
+	tempFileReaderFactory func(file *os.File, bufferSize int, deserialize D) io.TempFileReader[T]
+	tempFileWriterFactory func(file *os.File, bufferSize int, serialize S) io.TempFileWriter[T]
 	directoryPath         string
 	filePrefix            string
 	fileExtension         string
@@ -70,23 +66,23 @@ type Sorter[T any] struct {
 	mergeStr              string
 }
 
-func NewSorter[T any](
-	comparatorFunc func(a, b T) int,
-	getByteSize func(item T) int,
-	serialize func(item T, buf []byte) error,
-	deserialize func(data []byte) (T, error),
-	runGenerator RunGenerator[T],
-	mergeFunc MergeFunc[T],
-	tempFileReaderFactory CreateTempFileReaderFactory[T],
-	tempFileWriterFactory CreateTempFileWriterFactory[T],
+func NewSorter[T any, C utils.Comparator[T], U utils.GetByteSize[T], S utils.Serializer[T], D utils.Deserializer[T], M Merger[T, C]](
+	comparatorFunc C,
+	getByteSize U,
+	serialize S,
+	deserialize D,
+	mergeFunc M,
+	runGenerator RunGenerator[T, C, U, S, M],
+	tempFileReaderFactory func(file *os.File, bufferSize int, deserialize D) io.TempFileReader[T],
+	tempFileWriterFactory func(file *os.File, bufferSize int, serialize S) io.TempFileWriter[T],
 	directoryPath string,
 	filePrefix string,
 	fileExtension string,
 	readBufferSize int,
 	writeBufferSize int,
 	kWayMergeSize int,
-) *Sorter[T] {
-	return &Sorter[T]{
+) *Sorter[T, C, U, S, D, M] {
+	return &Sorter[T, C, U, S, D, M]{
 		comparatorFunc:        comparatorFunc,
 		getByteSize:           getByteSize,
 		serialize:             serialize,
@@ -106,7 +102,7 @@ func NewSorter[T any](
 	}
 }
 
-func (s *Sorter[T]) Sort(input iter.Seq[T]) (iter.Seq2[T, error], error) {
+func (s *Sorter[T, C, U, S, D, M]) Sort(input iter.Seq[T]) (iter.Seq2[T, error], error) {
 	if input == nil {
 		return nil, fmt.Errorf("input iterator is nil")
 	}
@@ -115,13 +111,9 @@ func (s *Sorter[T]) Sort(input iter.Seq[T]) (iter.Seq2[T, error], error) {
 		fileName := fmt.Sprintf("%s/%s_%s_%d_%05d.%s", s.directoryPath, s.filePrefix, s.runStr, currentRunIndex, index, s.fileExtension)
 		return os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
 	}
-	err := s.runGenerator.Initialize(s.comparatorFunc, s.getByteSize, s.serialize, createTmpFile, s.tempFileWriterFactory)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize run generator: %v", err)
-	}
 	// add logging to see how long it takes to generate runs
-	err = s.runGenerator.GenerateRuns(input)
-	fmt.Println("Run generation completed")
+	merge := s.mergeFunc
+	err := s.runGenerator.GenerateRuns(input, s.comparatorFunc, s.getByteSize, s.serialize, merge, createTmpFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate runs: %v", err)
 	}
@@ -162,7 +154,7 @@ func (s *Sorter[T]) Sort(input iter.Seq[T]) (iter.Seq2[T, error], error) {
 	return s.mergeFiles(files)
 }
 
-func (s *Sorter[T]) mergeFiles(files []string) (iter.Seq2[T, error], error) {
+func (s *Sorter[T, C, U, S, D, M]) mergeFiles(files []string) (iter.Seq2[T, error], error) {
 	if len(files) == 0 {
 		return nil, fmt.Errorf("no files to merge")
 	}
@@ -171,7 +163,7 @@ func (s *Sorter[T]) mergeFiles(files []string) (iter.Seq2[T, error], error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open file %s: %v", files[0], err)
 		}
-		reader := s.tempFileReaderFactory.CreateTempFileReader(file, s.readBufferSize, s.deserialize)
+		reader := s.tempFileReaderFactory(file, s.readBufferSize, s.deserialize)
 		return reader.All(), nil
 	}
 	slicesOfSeq := make([]iter.Seq2[T, error], 0, len(files))
@@ -180,13 +172,13 @@ func (s *Sorter[T]) mergeFiles(files []string) (iter.Seq2[T, error], error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open file %s: %v", fileName, err)
 		}
-		reader := s.tempFileReaderFactory.CreateTempFileReader(file, s.readBufferSize, s.deserialize)
+		reader := s.tempFileReaderFactory(file, s.readBufferSize, s.deserialize)
 		slicesOfSeq = append(slicesOfSeq, reader.All())
 	}
-	return s.mergeFunc(slicesOfSeq, s.comparatorFunc)
+	return s.mergeFunc.Merge(slicesOfSeq, s.comparatorFunc)
 }
 
-func (s *Sorter[T]) getFilesToMerge(isRun bool, level int) ([]string, error) {
+func (s *Sorter[T, C, U, S, D, M]) getFilesToMerge(isRun bool, level int) ([]string, error) {
 	entries, err := os.ReadDir(s.directoryPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read directory: %v", err)
@@ -204,7 +196,7 @@ func (s *Sorter[T]) getFilesToMerge(isRun bool, level int) ([]string, error) {
 	return files, nil
 }
 
-func (s *Sorter[T]) flushMergeSequence(mergeSeq iter.Seq2[T, error], currentMergeRound int, index int) error {
+func (s *Sorter[T, C, U, S, D, M]) flushMergeSequence(mergeSeq iter.Seq2[T, error], currentMergeRound int, index int) error {
 	// create a new temporary file for the merged output
 	// realistically index is 6 decimal digits
 	fileName := fmt.Sprintf("%s/%s_%s_%d_%06d.%s", s.directoryPath, s.filePrefix, s.mergeStr, currentMergeRound, index, s.fileExtension)
@@ -214,7 +206,7 @@ func (s *Sorter[T]) flushMergeSequence(mergeSeq iter.Seq2[T, error], currentMerg
 	}
 	defer file.Close()
 	// create a writer
-	writer := s.tempFileWriterFactory.CreateTempFileWriter(file, s.writeBufferSize, s.serialize)
+	writer := s.tempFileWriterFactory(file, s.writeBufferSize, s.serialize)
 	defer writer.Close()
 	err = writer.WriteSeq(func(yield func(T) bool) {
 		for r, err := range mergeSeq {
@@ -233,7 +225,7 @@ func (s *Sorter[T]) flushMergeSequence(mergeSeq iter.Seq2[T, error], currentMerg
 	return nil
 }
 
-func (s *Sorter[T]) deleteFiles(files []string) error {
+func (s *Sorter[T, C, U, S, D, M]) deleteFiles(files []string) error {
 	// asynchronously delete files
 	// FIXME: currently fire and forget
 	// in the future, we can use a worker pool to limit the number of concurrent deletions
@@ -248,78 +240,57 @@ func (s *Sorter[T]) deleteFiles(files []string) error {
 	return nil
 }
 
-func (s *Sorter[T]) openFile(fileName string) (*os.File, error) {
+func (s *Sorter[T, C, U, S, D, M]) openFile(fileName string) (*os.File, error) {
 	// simple open file for reading
 	filePath := filepath.Join(s.directoryPath, fileName)
 	return os.Open(filePath)
 }
 
-func (s *Sorter[T]) Close() error {
+func (s *Sorter[T, C, U, S, D, M]) Close() error {
 	// Implement any necessary cleanup logic here
 	// removes all files in the directory with the same prefix
 	return nil
 }
 
-type GoSortRunGenerator[T any] struct {
-	comparatorFunc        func(a, b T) int
-	getByteSize           func(item T) int
-	serialize             func(item T, buf []byte) error
-	createTmpFile         func(currentRunIndex int, index int) (*os.File, error)
-	tempFileWriterFactory CreateTempFileWriterFactory[T]
+type GoSortRunGenerator[T any, C utils.Comparator[T], U utils.GetByteSize[T], S utils.Serializer[T], M Merger[T, C]] struct {
+	tempFileWriterFactory func(file *os.File, bufferSize int, serialize S) io.TempFileWriter[T]
 	bufferSize            int // size of the in-memory buffer to hold items before sorting and flushing to disk
 	runSize               int // maximum size of each run in bytes
 	initialRunSize        int // estimated initial size of each run
 	sliceBuffer           []T
 	parallelism           int
-	mergeFunc             MergeFunc[T]
 }
 
-func NewGoSortRunGenerator[T any](
+func NewGoSortRunGenerator[T any, C utils.Comparator[T], U utils.GetByteSize[T], S utils.Serializer[T], M Merger[T, C]](
+	tempFileWriterFactory func(file *os.File, bufferSize int, serialize S) io.TempFileWriter[T],
 	bufferSize int,
 	runSize int,
 	initialRunSize int,
 	parallelism int,
-	mergeFunc MergeFunc[T],
-) *GoSortRunGenerator[T] {
-	runGen := &GoSortRunGenerator[T]{
-		bufferSize:     bufferSize,
-		runSize:        runSize,
-		initialRunSize: initialRunSize,
-		parallelism:    parallelism,
-		mergeFunc:      mergeFunc,
+) *GoSortRunGenerator[T, C, U, S, M] {
+	runGen := &GoSortRunGenerator[T, C, U, S, M]{
+		tempFileWriterFactory: tempFileWriterFactory,
+		bufferSize:            bufferSize,
+		runSize:               runSize,
+		initialRunSize:        initialRunSize,
+		parallelism:           parallelism,
 	}
 	runGen.sliceBuffer = make([]T, 0, initialRunSize)
 	return runGen
 }
 
-func (g *GoSortRunGenerator[T]) Initialize(
-	comparatorFunc func(a, b T) int,
-	getByteSize func(item T) int,
-	serialize func(item T, buf []byte) error,
-	createTmpFile func(currentRunIndex int, index int) (*os.File, error),
-	tempFileWriterFactory CreateTempFileWriterFactory[T],
-) error {
-	// TODO add nil checks for all functions
-	g.comparatorFunc = comparatorFunc
-	g.getByteSize = getByteSize
-	g.serialize = serialize
-	g.createTmpFile = createTmpFile
-	g.tempFileWriterFactory = tempFileWriterFactory
-	return nil
-}
-
-func (g *GoSortRunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
+func (g *GoSortRunGenerator[T, C, U, S, M]) GenerateRuns(input iter.Seq[T], comparatorFunc C, getByteSize U, serialize S, mergeFunc M, createTmpFile func(currentRunIndex int, index int) (*os.File, error)) error {
 	if input == nil {
 		return fmt.Errorf("input iterator is nil")
 	}
 	currentSizeBytes := 0
 	currentRunIndex := 0
 	for t := range input {
-		byteSize := g.getByteSize(t)
+		byteSize := getByteSize.GetByteSize(t)
 		addedSize := currentSizeBytes + byteSize
 		if addedSize > g.runSize {
 			// sort and flush
-			if err := g.sortAndFlush(currentRunIndex); err != nil {
+			if err := g.sortAndFlush(currentRunIndex, comparatorFunc, serialize, mergeFunc, createTmpFile); err != nil {
 				return fmt.Errorf("failed to sort and flush: %v", err)
 			}
 			currentSizeBytes = 0
@@ -335,7 +306,7 @@ func (g *GoSortRunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
 	}
 	// flush the remaining items
 	if len(g.sliceBuffer) > 0 {
-		if err := g.sortAndFlush(currentRunIndex); err != nil {
+		if err := g.sortAndFlush(currentRunIndex, comparatorFunc, serialize, mergeFunc, createTmpFile); err != nil {
 			return fmt.Errorf("failed to sort and flush remaining items: %v", err)
 		}
 	}
@@ -345,11 +316,15 @@ func (g *GoSortRunGenerator[T]) GenerateRuns(input iter.Seq[T]) error {
 // sortAndFlush sorts the current sliceBuffer and flushes it to a temporary file using multiple goroutines.
 // It divides the sliceBuffer into chunks and sorts each chunk in parallel, writing each sorted chunk to a separate temporary file.
 // This approach allows for concurrent sorting and writing, improving performance on multi-core systems.
-func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
+func (g *GoSortRunGenerator[T, C, U, S, M]) sortAndFlush(currentRunIndex int, comparatorFunc C, serialize S, mergeFunc M, createTmpFile func(currentRunIndex int, index int) (*os.File, error)) error {
 	// current plan not to use errgroup
 	// change in the future if needed
 	var sortedSeq iter.Seq2[T, error]
 	var err error
+	// currently we use a wrapper around the comparator function
+	cmpFunc := func(a, b T) int {
+		return comparatorFunc.Compare(a, b)
+	}
 	if g.parallelism > 1 {
 		var wg sync.WaitGroup
 		errorsChan := make(chan error, g.parallelism)
@@ -368,7 +343,7 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 				end := min((i+1)*chunkSize, len(g.sliceBuffer))
 				part := g.sliceBuffer[start:end]
 				// Sort the chunk
-				slices.SortFunc(part, g.comparatorFunc)
+				slices.SortFunc(part, cmpFunc)
 				// Send the sorted chunk to the chunks channel
 				chunksChan <- part
 			}(i)
@@ -402,14 +377,13 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 		defer close(chunksChan)
 		// single threaded merge now to
 		// merge all chunks into a single sorted sequence
-		sortedSeq, err = g.mergeFunc(chunks, g.comparatorFunc)
-		//sortedSeq, err = MergeTournamentFunc(chunks, g.comparatorFunc)
+		sortedSeq, err = mergeFunc.Merge(chunks, comparatorFunc)
 		if err != nil {
 			return fmt.Errorf("failed to merge sorted chunks: %v", err)
 		}
 	} else {
 		// Sort the entire sliceBuffer
-		slices.SortFunc(g.sliceBuffer, g.comparatorFunc)
+		slices.SortFunc(g.sliceBuffer, cmpFunc)
 		// Create a sequence from the sorted sliceBuffer
 		sortedSeq = func(yield func(T, error) bool) {
 			for _, item := range g.sliceBuffer {
@@ -419,12 +393,12 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 			}
 		}
 	}
-	tmpFile, err := g.createTmpFile(currentRunIndex, 0)
+	tmpFile, err := createTmpFile(currentRunIndex, 0)
 	if err != nil {
 		return fmt.Errorf("failed to create temporary file: %v", err)
 	}
 	defer tmpFile.Close()
-	writer := g.tempFileWriterFactory.CreateTempFileWriter(tmpFile, g.bufferSize, g.serialize)
+	writer := g.tempFileWriterFactory(tmpFile, g.bufferSize, serialize)
 	if err := writer.WriteSeq(func(yield func(T) bool) {
 		for r, err := range sortedSeq {
 			if err != nil {
@@ -441,20 +415,41 @@ func (g *GoSortRunGenerator[T]) sortAndFlush(currentRunIndex int) error {
 	return nil
 }
 
+// PullIterRecordPair is a helper struct to hold the current record and the next function of an iterator
+type PullIterRecordPair[T any] struct {
+	record T
+	next   func() (T, error, bool)
+	stop   func()
+}
+
+// internal comparator for PullIterRecordPair
+type PullIterRecordPairComparator[T any, C utils.Comparator[T]] struct {
+	c C
+}
+
+func NewPullIterRecordPairComparator[T any, C utils.Comparator[T]](c C) PullIterRecordPairComparator[T, C] {
+	return PullIterRecordPairComparator[T, C]{c: c}
+}
+
+func (c PullIterRecordPairComparator[T, C]) Compare(a, b PullIterRecordPair[T]) int {
+	return c.c.Compare(a.record, b.record)
+}
+
+// HeapMerger is a merger that uses a min-heap to merge sorted sequences.
+type HeapMerger[T any, C utils.Comparator[T]] struct {
+}
+
 // MergeHeapFunc has the type of MergeFunc that uses a min-heap to merge sorted sequences.
 // It takes a slice of sorted sequences and a comparator function, and returns a single merged sequence.
 // It returns an error if any of the input sequences yield an error.
-func MergeHeapFunc[T any](sequences []iter.Seq2[T, error], comparatorFunc func(a, b T) int) (iter.Seq2[T, error], error) {
+func (h HeapMerger[T, C]) Merge(sequences []iter.Seq2[T, error], comparatorFunc C) (iter.Seq2[T, error], error) {
 	// create heap
-	heapCompare := func(a, b PullIterRecordPair[T]) int {
-		return comparatorFunc(a.record, b.record)
-	}
-	mergeHeap := &MergeHeap[PullIterRecordPair[T]]{
+	heapCompare := NewPullIterRecordPairComparator(comparatorFunc)
+	mergeHeap := &MergeHeap[PullIterRecordPair[T], PullIterRecordPairComparator[T, C]]{
 		items:   []PullIterRecordPair[T]{},
 		compare: heapCompare,
 	}
 	heap.Init(mergeHeap)
-
 	// Implement merging logic here
 	for _, s := range sequences {
 		// pull the first item from each sequence
@@ -469,9 +464,6 @@ func MergeHeapFunc[T any](sequences []iter.Seq2[T, error], comparatorFunc func(a
 		pair := PullIterRecordPair[T]{record: r, next: next, stop: stop}
 		heap.Push(mergeHeap, pair)
 	}
-	// repeatedly pull the smallest item from the heap and push the next item from the same sequence
-	// until all sequences are exhausted
-	// return an iterator that yields the merged items
 	return func(yield func(T, error) bool) {
 		for mergeHeap.Len() > 0 {
 			// pull the smallest item from the heap
@@ -498,37 +490,30 @@ func MergeHeapFunc[T any](sequences []iter.Seq2[T, error], comparatorFunc func(a
 	}, nil
 }
 
-// PullIterRecordPair is a helper struct to hold the current record and the next function of an iterator
-type PullIterRecordPair[T any] struct {
-	record T
-	next   func() (T, error, bool)
-	stop   func()
-}
-
 // MergeHeap is a min-heap used for merging sorted sequences.
 // uses standard library container/heap interface
-type MergeHeap[T any] struct {
+type MergeHeap[T any, C utils.Comparator[T]] struct {
 	items   []T
-	compare func(a, b T) int
+	compare C
 }
 
-func (h *MergeHeap[T]) Len() int {
+func (h *MergeHeap[T, C]) Len() int {
 	return len(h.items)
 }
 
-func (h *MergeHeap[T]) Less(i, j int) bool {
-	return h.compare(h.items[i], h.items[j]) < 0
+func (h *MergeHeap[T, C]) Less(i, j int) bool {
+	return h.compare.Compare(h.items[i], h.items[j]) < 0
 }
 
-func (h *MergeHeap[T]) Swap(i, j int) {
+func (h *MergeHeap[T, C]) Swap(i, j int) {
 	h.items[i], h.items[j] = h.items[j], h.items[i]
 }
 
-func (h *MergeHeap[T]) Push(x any) {
+func (h *MergeHeap[T, C]) Push(x any) {
 	h.items = append(h.items, x.(T))
 }
 
-func (h *MergeHeap[T]) Pop() any {
+func (h *MergeHeap[T, C]) Pop() any {
 	old := h.items
 	n := len(old)
 	x := old[n-1]
@@ -536,12 +521,14 @@ func (h *MergeHeap[T]) Pop() any {
 	return x
 }
 
-// MergeTournamentFunc has the type of MergeFunc that uses a tournament tree to merge sorted sequences.
-func MergeTournamentFunc[T any](sequences []iter.Seq2[T, error], comparatorFunc func(a, b T) int) (iter.Seq2[T, error], error) {
+// TournamentMerger is a merger that uses a tournament tree to merge sorted sequences.
+type TournamentMerger[T any, C utils.Comparator[T]] struct {
+}
+
+func (TournamentMerger[T, C]) Merge(sequences []iter.Seq2[T, error], comparatorFunc C) (iter.Seq2[T, error], error) {
 	// create tournament tree
-	tournament := NewTournamentTree(func(a, b PullIterRecordPair[T]) int {
-		return comparatorFunc(a.record, b.record)
-	})
+	recordPairComparator := NewPullIterRecordPairComparator(comparatorFunc)
+	tournament := NewTournamentTree(recordPairComparator)
 	contestents := make([]*PullIterRecordPair[T], len(sequences))
 	for i, s := range sequences {
 		next, stop := iter.Pull2(s)
@@ -608,17 +595,17 @@ func (t TournamentNode[T]) String() string {
 }
 
 // TournamentTree: a k-way merge algorithm using a tournament tree
-type TournamentTree[T any] struct {
+type TournamentTree[T any, C utils.Comparator[T]] struct {
 	tree           []TournamentNode[T]
-	comparatorFunc func(a, b T) int
+	comparatorFunc C
 }
 
-func NewTournamentTree[T any](comparatorFunc func(a, b T) int) *TournamentTree[T] {
-	return &TournamentTree[T]{tree: nil, comparatorFunc: comparatorFunc}
+func NewTournamentTree[T any, C utils.Comparator[T]](comparatorFunc C) *TournamentTree[T, C] {
+	return &TournamentTree[T, C]{tree: nil, comparatorFunc: comparatorFunc}
 }
 
 // VeryFirstTournament initializes the tournament tree with the given contestants.
-func (t *TournamentTree[T]) VeryFirstTournament(contestants []*T) {
+func (t *TournamentTree[T, C]) VeryFirstTournament(contestants []*T) {
 	// passes the winners and bulds the users, every node touches once
 	// contestants are the leaves of the tree
 	// build the tree from the leaves to the root
@@ -687,7 +674,7 @@ func (t *TournamentTree[T]) VeryFirstTournament(contestants []*T) {
 			left := *leftChild.winner.value
 			right := *rightChild.winner.value
 			// wrestle
-			if t.comparatorFunc(left, right) <= 0 {
+			if t.comparatorFunc.Compare(left, right) <= 0 {
 				t.tree[i].winner = leftChild.winner
 				t.tree[i].idx = rightChild.winner.idx // store looser index
 				t.tree[i].value = rightChild.winner.value
@@ -701,7 +688,7 @@ func (t *TournamentTree[T]) VeryFirstTournament(contestants []*T) {
 }
 
 // Winner returns the current winner of the tournament
-func (t *TournamentTree[T]) Winner() (winner *TournamentNode[T], ok bool) {
+func (t *TournamentTree[T, C]) Winner() (winner *TournamentNode[T], ok bool) {
 	if len(t.tree) == 0 {
 		return nil, false
 	}
@@ -712,7 +699,7 @@ func (t *TournamentTree[T]) Winner() (winner *TournamentNode[T], ok bool) {
 }
 
 // Challenge updates the tournament tree with a new challenger
-func (t *TournamentTree[T]) Challenge(challenger *TournamentNode[T]) {
+func (t *TournamentTree[T, C]) Challenge(challenger *TournamentNode[T]) {
 	// get the leaf node at index  at update its looser value
 	index := challenger.idx
 	currentChallenger := challenger
@@ -736,7 +723,7 @@ func (t *TournamentTree[T]) Challenge(challenger *TournamentNode[T]) {
 		}
 		parentLooserValue := *parent.value
 		challengerValue := *currentChallenger.value
-		if t.comparatorFunc(parentLooserValue, challengerValue) <= 0 {
+		if t.comparatorFunc.Compare(parentLooserValue, challengerValue) <= 0 {
 			// parent looser wins
 			parent.winner = &t.tree[parent.idx]
 			parent.idx = currentChallenger.idx

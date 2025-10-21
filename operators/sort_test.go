@@ -17,22 +17,6 @@ import (
 	"github.com/daniarleagk/paloo_db/io"
 )
 
-type FixedSizeTempFileWriterFactory[T any] struct {
-	recordSize int
-}
-
-func (f *FixedSizeTempFileWriterFactory[T]) CreateTempFileWriter(file *os.File, bufferSize int, serialize func(item T, buf []byte) error) io.TempFileWriter[T] {
-	return io.NewFixedSizeTempFileWriter(file, bufferSize, f.recordSize, serialize)
-}
-
-type FixedSizeTempFileReaderFactory[T any] struct {
-	recordSize int
-}
-
-func (f *FixedSizeTempFileReaderFactory[T]) CreateTempFileReader(file *os.File, bufferSize int, deserialize func(data []byte) (T, error)) io.TempFileReader[T] {
-	return io.NewFixedLenTempFileReader(file, bufferSize, f.recordSize, deserialize)
-}
-
 func permutate[T any](slice []T) []T {
 	n := len(slice)
 	r := rand.New(rand.NewSource(42))
@@ -47,6 +31,26 @@ func permutate[T any](slice []T) []T {
 	return slice
 }
 
+type Int32DSCmp struct{}
+
+func (d Int32DSCmp) Deserialize(data []byte) (int32, error) {
+	return int32(binary.BigEndian.Uint32(data)), nil
+}
+
+// Serialize
+func (d Int32DSCmp) Serialize(item int32, buf []byte) error {
+	binary.BigEndian.PutUint32(buf, uint32(item))
+	return nil
+}
+
+func (d Int32DSCmp) Compare(a, b int32) int {
+	return int(a - b)
+}
+
+func (g Int32DSCmp) GetByteSize(item int32) int {
+	return 4
+}
+
 func TestGoSortRunGenerator(t *testing.T) {
 	elementsCount := 128 + 30 // we would have three runs each run will be sorted in parallel producing 4 files per run
 	readWriteBufferSize := 64 // 12 bytes per page header 64 -12 = 52 bytes for data => 13 int32 per page
@@ -58,30 +62,22 @@ func TestGoSortRunGenerator(t *testing.T) {
 		int32Slice = append(int32Slice, int32(i))
 	}
 	int32Slice = permutate(int32Slice)
-	serialize := func(item int32, buf []byte) error {
-		binary.BigEndian.PutUint32(buf, uint32(item))
-		return nil
-	}
-
-	comparator := func(a, b int32) int {
-		return int(a - b)
-	}
-	getByteSize := func(item int32) int {
-		return 4 // size of int32
-	}
-	runGenerator := NewGoSortRunGenerator(
-		readWriteBufferSize,        // buffer size
-		runSizeByteMemory,          // run size
-		128/4,                      // initial run size
-		parallelism,                // parallelism
-		MergeTournamentFunc[int32], // merge function
+	merger := TournamentMerger[int32, Int32DSCmp]{}
+	runGenerator := NewGoSortRunGenerator[int32, Int32DSCmp, Int32DSCmp, Int32DSCmp, TournamentMerger[int32, Int32DSCmp]](
+		func(file *os.File, bufferSize int, serialize Int32DSCmp) io.TempFileWriter[int32] {
+			return io.NewFixedSizeTempFileWriter(file, bufferSize, 4, serialize)
+		},
+		readWriteBufferSize, // buffer size
+		runSizeByteMemory,   // run size
+		128/4,               // initial run size
+		parallelism,         // parallelism
 	)
+	int32DSCmp := Int32DSCmp{}
 	createTmpFile := func(currentRunIndex int, index int) (*os.File, error) {
 		fileName := fmt.Sprintf("%s/%s_run_%06d_%03d.%s", directory, "sort", currentRunIndex, index, "tmp")
 		return os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
 	}
-	runGenerator.Initialize(comparator, getByteSize, serialize, createTmpFile, &FixedSizeTempFileWriterFactory[int32]{recordSize: 4})
-	err := runGenerator.GenerateRuns(slices.Values(int32Slice))
+	err := runGenerator.GenerateRuns(slices.Values(int32Slice), int32DSCmp, int32DSCmp, int32DSCmp, merger, createTmpFile)
 	if err != nil {
 		t.Fatalf("failed to generate runs: %v", err)
 	}
@@ -97,9 +93,6 @@ func TestGoSortRunGenerator(t *testing.T) {
 		}
 	}
 	slices.Sort(files)
-	deserialize := func(data []byte) (int32, error) {
-		return int32(binary.BigEndian.Uint32(data)), nil
-	}
 	t.Log("Generated files:", files)
 	count := 0
 	//if len(files) != 12 { // 3 runs * 4 parallelism
@@ -110,7 +103,7 @@ func TestGoSortRunGenerator(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to open file %s: %v", file, err)
 		}
-		reader := io.NewFixedLenTempFileReader(f, 64, 4, deserialize)
+		reader := io.NewFixedLenTempFileReader(f, 64, 4, int32DSCmp)
 		t.Logf("Reading file: %s", file)
 		previous := int32(-1)
 		for r, err := range reader.All() { // just to ensure we can read all records
@@ -179,9 +172,10 @@ func TestKWayMerger(t *testing.T) {
 		sequences = append(sequences, mappedIt)
 	}
 	t.Logf("Merging %d sequences", len(sequences))
-	mergedSeq, err := MergeHeapFunc(sequences, func(a, b int32) int {
-		return int(a - b)
-	})
+
+	merger := HeapMerger[int32, Int32DSCmp]{}
+	comparator := Int32DSCmp{}
+	mergedSeq, err := merger.Merge(sequences, comparator)
 	if err != nil {
 		t.Fatalf("failed to merge sequences: %v", err)
 	}
@@ -214,7 +208,13 @@ func printTournamentTree[T any](tree []TournamentNode[T]) {
 	}
 }
 
-func initTestTournamentTree() (*TournamentTree[PullIterRecordPair[int]], []*PullIterRecordPair[int]) {
+type IntCmp struct{}
+
+func (IntCmp) Compare(a, b PullIterRecordPair[int]) int {
+	return a.record - b.record
+}
+
+func initTestTournamentTree() (*TournamentTree[PullIterRecordPair[int], IntCmp], []*PullIterRecordPair[int]) {
 	k := 9
 	a1 := []int{3, 12, 18}
 	a2 := []int{1, 16, 21, 27}
@@ -289,10 +289,8 @@ func initTestTournamentTree() (*TournamentTree[PullIterRecordPair[int]], []*Pull
 	r9, _, _ := n9()
 	p9 := PullIterRecordPair[int]{record: r9, next: n9, stop: s9}
 	iterSlice = append(iterSlice, &p9)
-
-	tournament := NewTournamentTree(func(a, b PullIterRecordPair[int]) int {
-		return a.record - b.record
-	})
+	cmp := IntCmp{}
+	tournament := NewTournamentTree(cmp)
 	tournament.VeryFirstTournament(iterSlice)
 	return tournament, iterSlice
 }
@@ -352,9 +350,8 @@ func TestTournamentMerge(t *testing.T) {
 		sequences = append(sequences, mappedIt)
 	}
 	t.Logf("Merging %d sequences", len(sequences))
-	mergedSeq, err := MergeTournamentFunc(sequences, func(a, b int32) int {
-		return int(a - b)
-	})
+	merger := TournamentMerger[int32, Int32DSCmp]{}
+	mergedSeq, err := merger.Merge(sequences, Int32DSCmp{})
 	if err != nil {
 		t.Fatalf("failed to merge sequences: %v", err)
 	}
@@ -377,6 +374,26 @@ func TestTournamentMerge(t *testing.T) {
 	}
 }
 
+type Int64DSCmp struct{}
+
+func (d Int64DSCmp) Deserialize(data []byte) (int64, error) {
+	return int64(binary.BigEndian.Uint64(data)), nil
+}
+
+// Serialize
+func (d Int64DSCmp) Serialize(item int64, buf []byte) error {
+	binary.BigEndian.PutUint64(buf, uint64(item))
+	return nil
+}
+
+func (d Int64DSCmp) Compare(a, b int64) int {
+	return int(a - b)
+}
+
+func (g Int64DSCmp) GetByteSize(item int64) int {
+	return 8
+}
+
 func TestSimpleInt64Sort(t *testing.T) {
 	elementsCount := 100
 	int64Slice := make([]int64, 0, elementsCount)
@@ -384,44 +401,37 @@ func TestSimpleInt64Sort(t *testing.T) {
 		int64Slice = append(int64Slice, int64(i))
 	}
 	int64Slice = permutate(int64Slice)
-	comparator := func(a, b int64) int {
-		return int(a - b)
-	}
-	getByteSize := func(item int64) int {
-		return 8 // size of int64
-	}
-	serialize := func(item int64, buf []byte) error {
-		binary.BigEndian.PutUint64(buf, uint64(item))
-		return nil
-	}
-	deserialize := func(data []byte) (int64, error) {
-		return int64(binary.BigEndian.Uint64(data)), nil
-	}
 	tmpDirectory := t.TempDir()
 	prefix := "int64sort"
 	suffix := "tmp"
-	factoryReader := &FixedSizeTempFileReaderFactory[int64]{recordSize: 8}
-	factoryWriter := &FixedSizeTempFileWriterFactory[int64]{recordSize: 8}
 	parallel := 1
 	kWay := 4
 	readBufferSize, writeBufferSize := 128, 128 // 12 bytes per page header 128 -12 = 116 bytes for data => 14 int64 per page
 	runSize := 512                              // 512 /8 = 64 int64 per run
-	runGenerator := NewGoSortRunGenerator(
+	runGenerator := NewGoSortRunGenerator[int64, Int64DSCmp, Int64DSCmp, Int64DSCmp, HeapMerger[int64, Int64DSCmp]](
+		func(file *os.File, bufferSize int, serialize Int64DSCmp) io.TempFileWriter[int64] {
+			return io.NewFixedSizeTempFileWriter(file, bufferSize, 8, serialize)
+		},
 		readBufferSize,
 		runSize,
 		512/8, // initial run size
 		parallel,
-		MergeHeapFunc[int64],
 	)
+	cmpDeSer := Int64DSCmp{}
+	merger := HeapMerger[int64, Int64DSCmp]{}
 	sorter := NewSorter(
-		comparator,
-		getByteSize,
-		serialize,
-		deserialize,
+		cmpDeSer,
+		cmpDeSer,
+		cmpDeSer,
+		cmpDeSer,
+		merger,
 		runGenerator,
-		MergeHeapFunc,
-		factoryReader,
-		factoryWriter,
+		func(file *os.File, bufferSize int, deserialize Int64DSCmp) io.TempFileReader[int64] {
+			return io.NewFixedLenTempFileReader(file, bufferSize, 8, deserialize)
+		},
+		func(file *os.File, bufferSize int, serialize Int64DSCmp) io.TempFileWriter[int64] {
+			return io.NewFixedSizeTempFileWriter(file, bufferSize, 8, serialize)
+		},
 		tmpDirectory,
 		prefix,
 		suffix,
@@ -463,19 +473,6 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 		int64Slice = append(int64Slice, int64(i))
 	}
 	int64Slice = permutate(int64Slice)
-	comparator := func(a, b int64) int {
-		return int(a - b)
-	}
-	getByteSize := func(item int64) int {
-		return 8 // size of int64
-	}
-	serialize := func(item int64, buf []byte) error {
-		binary.BigEndian.PutUint64(buf, uint64(item))
-		return nil
-	}
-	deserialize := func(data []byte) (int64, error) {
-		return int64(binary.BigEndian.Uint64(data)), nil
-	}
 	tests := []struct {
 		name string
 		heap bool
@@ -490,52 +487,93 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 			t.Logf("Using temp directory: %s", tmpDirectory)
 			prefix := "int64sort"
 			suffix := "tmp"
-			var mergeFunc MergeFunc[int64]
-			if tt.heap {
-				mergeFunc = MergeHeapFunc
-			} else {
-				mergeFunc = MergeTournamentFunc
-			}
-			factoryReader := &FixedSizeTempFileReaderFactory[int64]{recordSize: 8}
-			factoryWriter := &FixedSizeTempFileWriterFactory[int64]{recordSize: 8}
-			parallelism := 8
+			parallelism := 12
 			kWay := 64                                            // memory is 128 KB * 100 at least
-			readBufferSize, writeBufferSize := 1024*256, 1024*256 // 256 KB
+			readBufferSize, writeBufferSize := 1024*512, 1024*512 // 512 KB
 			runSize := 1024 * 1024 * 16                           // 16 MB Buffer
-			runGenerator := NewGoSortRunGenerator(
-				readBufferSize,
-				runSize,
-				(runSize)/8*2, // initial run size
-				parallelism,
-				mergeFunc,
-			)
-			sorter := NewSorter(
-				comparator,
-				getByteSize,
-				serialize,
-				deserialize,
-				runGenerator,
-				mergeFunc,
-				factoryReader,
-				factoryWriter,
-				tmpDirectory,
-				prefix,
-				suffix,
-				readBufferSize,
-				writeBufferSize,
-				kWay,
-			)
-			start := time.Now()
-			sortedSeq, err := sorter.Sort(slices.Values(int64Slice))
-			duration := time.Since(start)
-			t.Logf("Sort -1 merge %s", duration)
-
-			if err != nil {
-				t.Fatalf("failed to sort: %v", err)
+			var sortedSeq iter.Seq2[int64, error]
+			var err error
+			if tt.heap {
+				runGenerator := NewGoSortRunGenerator[int64, Int64DSCmp, Int64DSCmp, Int64DSCmp, HeapMerger[int64, Int64DSCmp]](
+					func(file *os.File, bufferSize int, serialize Int64DSCmp) io.TempFileWriter[int64] {
+						return io.NewFixedSizeTempFileWriter(file, bufferSize, 8, serialize)
+					},
+					readBufferSize,
+					runSize,
+					(runSize)/8, // initial run size
+					parallelism,
+				)
+				cmpDeSer := Int64DSCmp{}
+				sorter := NewSorter(
+					cmpDeSer,
+					cmpDeSer,
+					cmpDeSer,
+					cmpDeSer,
+					HeapMerger[int64, Int64DSCmp]{},
+					runGenerator,
+					func(file *os.File, bufferSize int, deserialize Int64DSCmp) io.TempFileReader[int64] {
+						return io.NewFixedLenTempFileReader(file, bufferSize, 8, deserialize)
+					},
+					func(file *os.File, bufferSize int, serialize Int64DSCmp) io.TempFileWriter[int64] {
+						return io.NewFixedSizeTempFileWriter(file, bufferSize, 8, serialize)
+					},
+					tmpDirectory,
+					prefix,
+					suffix,
+					readBufferSize,
+					writeBufferSize,
+					kWay,
+				)
+				start := time.Now()
+				sortedSeq, err = sorter.Sort(slices.Values(int64Slice))
+				if err != nil {
+					t.Fatalf("failed to sort: %v", err)
+				}
+				duration := time.Since(start)
+				t.Logf("Sort -1 merge %s", duration)
+			} else {
+				runGenerator := NewGoSortRunGenerator[int64, Int64DSCmp, Int64DSCmp, Int64DSCmp, TournamentMerger[int64, Int64DSCmp]](
+					func(file *os.File, bufferSize int, serialize Int64DSCmp) io.TempFileWriter[int64] {
+						return io.NewFixedSizeTempFileWriter(file, bufferSize, 8, serialize)
+					},
+					readBufferSize,
+					runSize,
+					(runSize)/8, // initial run size
+					parallelism,
+				)
+				cmpDeSer := Int64DSCmp{}
+				sorter := NewSorter(
+					cmpDeSer,
+					cmpDeSer,
+					cmpDeSer,
+					cmpDeSer,
+					TournamentMerger[int64, Int64DSCmp]{},
+					runGenerator,
+					func(file *os.File, bufferSize int, deserialize Int64DSCmp) io.TempFileReader[int64] {
+						return io.NewFixedLenTempFileReader(file, bufferSize, 8, deserialize)
+					},
+					func(file *os.File, bufferSize int, serialize Int64DSCmp) io.TempFileWriter[int64] {
+						return io.NewFixedSizeTempFileWriter(file, bufferSize, 8, serialize)
+					},
+					tmpDirectory,
+					prefix,
+					suffix,
+					readBufferSize,
+					writeBufferSize,
+					kWay,
+				)
+				start := time.Now()
+				sortedSeq, err = sorter.Sort(slices.Values(int64Slice))
+				if err != nil {
+					t.Fatalf("failed to sort: %v", err)
+				}
+				duration := time.Since(start)
+				t.Logf("Sort -1 merge %s", duration)
 			}
+
 			previous := int64(-1)
 			count := 0
-			start = time.Now()
+			start := time.Now()
 			for r, err := range sortedSeq {
 				if err != nil {
 					t.Errorf("read failed: %v", err)
@@ -549,7 +587,7 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 			if count != elementsCount {
 				t.Errorf("expected to read %d records, but got %d", elementsCount, count)
 			}
-			duration = time.Since(start)
+			duration := time.Since(start)
 			t.Logf("Last Merge %s", duration)
 		})
 	}

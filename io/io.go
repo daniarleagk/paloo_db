@@ -255,17 +255,17 @@ type TempFileReader[T any] interface {
 
 // BlockTempFileWriter simple wrapper temp file writer streamed and buffered
 // assumption is that record fits into block/buffer
-type BlockTempFileWriter[T any, B TmpBlock] struct {
+type BlockTempFileWriter[T any, B TmpBlock, S utils.Serializer[T]] struct {
 	file        *os.File
 	bufferSize  int
-	serialize   func(item T, buf []byte) error
+	serialize   S
 	bufferBlock B
 	recordSize  int
 }
 
-func NewFixedSizeTempFileWriter[T any](file *os.File, bufferSize int, recordSize int, serialize func(item T, buf []byte) error) *BlockTempFileWriter[T, *FixedSizeRecordBlock] {
+func NewFixedSizeTempFileWriter[T any](file *os.File, bufferSize int, recordSize int, serialize utils.Serializer[T]) *BlockTempFileWriter[T, *FixedSizeRecordBlock, utils.Serializer[T]] {
 	bufferBlock := NewFixedSizeRecordBlock(bufferSize, recordSize)
-	return &BlockTempFileWriter[T, *FixedSizeRecordBlock]{
+	return &BlockTempFileWriter[T, *FixedSizeRecordBlock, utils.Serializer[T]]{
 		file:        file,
 		bufferSize:  bufferSize,
 		serialize:   serialize,
@@ -274,10 +274,10 @@ func NewFixedSizeTempFileWriter[T any](file *os.File, bufferSize int, recordSize
 	}
 }
 
-func (w *BlockTempFileWriter[T, B]) WriteSeq(recordSeq iter.Seq[T]) error {
+func (w *BlockTempFileWriter[T, B, S]) WriteSeq(recordSeq iter.Seq[T]) error {
 	buf := make([]byte, w.recordSize) // allocate buffer
 	for record := range recordSeq {
-		err := w.serialize(record, buf)
+		err := w.serialize.Serialize(record, buf)
 		if err != nil {
 			return err
 		}
@@ -300,14 +300,14 @@ func (w *BlockTempFileWriter[T, B]) WriteSeq(recordSeq iter.Seq[T]) error {
 	return nil
 }
 
-func (w *BlockTempFileWriter[T, B]) Flush() error {
+func (w *BlockTempFileWriter[T, B, S]) Flush() error {
 	// currently don´t use fsync
 	// FIXME for WAL writer
 	_, err := w.file.Write(w.bufferBlock.ToByteArray())
 	return err
 }
 
-func (w *BlockTempFileWriter[T, B]) Close() error {
+func (w *BlockTempFileWriter[T, B, S]) Close() error {
 	// flush remaining data
 	if err := w.Flush(); err != nil {
 		return err
@@ -316,16 +316,16 @@ func (w *BlockTempFileWriter[T, B]) Close() error {
 }
 
 // TempFileReader simple wrapper temp file reader buffered
-type BlockTempFileReader[T any, B TmpBlock] struct {
+type BlockTempFileReader[T any, B TmpBlock, D utils.Deserializer[T]] struct {
 	file        *os.File
-	deserialize func(data []byte) (T, error)
+	deserialize D
 	bufferSize  int
 	bufferBlock B
 }
 
-func NewFixedLenTempFileReader[T any](file *os.File, bufferSize int, recordSize int, deserialize func(data []byte) (T, error)) *BlockTempFileReader[T, *FixedSizeRecordBlock] {
+func NewFixedLenTempFileReader[T any](file *os.File, bufferSize int, recordSize int, deserialize utils.Deserializer[T]) *BlockTempFileReader[T, *FixedSizeRecordBlock, utils.Deserializer[T]] {
 	block := NewFixedSizeRecordBlock(bufferSize, recordSize)
-	return &BlockTempFileReader[T, *FixedSizeRecordBlock]{
+	return &BlockTempFileReader[T, *FixedSizeRecordBlock, utils.Deserializer[T]]{
 		file:        file,
 		bufferSize:  bufferSize,
 		bufferBlock: &block,
@@ -333,9 +333,9 @@ func NewFixedLenTempFileReader[T any](file *os.File, bufferSize int, recordSize 
 	}
 }
 
-func NewVarLenTempFileReader[T any](file *os.File, bufferSize int, deserialize func(data []byte) (T, error)) *BlockTempFileReader[T, *VarLenRecordBlock] {
+func NewVarLenTempFileReader[T any](file *os.File, bufferSize int, deserialize utils.Deserializer[T]) *BlockTempFileReader[T, *VarLenRecordBlock, utils.Deserializer[T]] {
 	block := NewVarLenRecordBlock(bufferSize)
-	return &BlockTempFileReader[T, *VarLenRecordBlock]{
+	return &BlockTempFileReader[T, *VarLenRecordBlock, utils.Deserializer[T]]{
 		file:        file,
 		bufferSize:  bufferSize,
 		bufferBlock: &block,
@@ -343,7 +343,7 @@ func NewVarLenTempFileReader[T any](file *os.File, bufferSize int, deserialize f
 	}
 }
 
-func (r *BlockTempFileReader[T, B]) All() iter.Seq2[T, error] {
+func (r *BlockTempFileReader[T, B, D]) All() iter.Seq2[T, error] {
 	f := func(yield func(T, error) bool) {
 	outerLoop:
 		for {
@@ -358,7 +358,7 @@ func (r *BlockTempFileReader[T, B]) All() iter.Seq2[T, error] {
 			}
 			r.bufferBlock.Bootstrap()
 			for bSlice := range r.bufferBlock.All() {
-				record, err := r.deserialize(bSlice)
+				record, err := r.deserialize.Deserialize(bSlice)
 				if err != nil {
 					yield(utils.Zero[T](), err)
 					break outerLoop
@@ -373,7 +373,7 @@ func (r *BlockTempFileReader[T, B]) All() iter.Seq2[T, error] {
 	return f
 }
 
-func (r *BlockTempFileReader[T, B]) Close() error {
+func (r *BlockTempFileReader[T, B, D]) Close() error {
 	return r.file.Close()
 }
 
