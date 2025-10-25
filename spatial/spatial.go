@@ -2,72 +2,145 @@
 // This source code is licensed under the MIT license found in the LICENSE.txt file in the root directory.
 package spatial
 
-import (
-	"encoding/binary"
-	"errors"
-	"math"
+import "fmt"
 
-	"github.com/daniarleagk/paloo_db/utils"
-)
+// DoublePoint represents a point in N-dimensional space using double-precision floating-point numbers.
+type DoublePoint []float64
 
+func (d DoublePoint) Dimension() int {
+	return len(d)
+}
+
+// DoublePointRectangle represents a rectangle in N-dimensional space using double-precision floating-point numbers.
 type DoublePointRectangle struct {
-	dimension uint16
-	lowLeft   []float64
-	upRight   []float64
+	lowLeft DoublePoint
+	upRight DoublePoint
 }
 
-func getDoublePointRectangleDeSerFunc() utils.DeSerFunc[DoublePointRectangle] {
-	return func(data []byte) (st DoublePointRectangle, err error) {
-		// read the dimension
-		// slice first 2 bytes
-		dimension := binary.BigEndian.Uint16(data[:2])
-		if capacity := 2 + 2*int(dimension)*8; len(data) < capacity {
-			return DoublePointRectangle{}, errors.New("not enough capacity to build ")
+// returns  a pointer to a new DoublePointRectangle
+func NewDoublePointRectangle(lowLeft, upRight DoublePoint) (*DoublePointRectangle, error) {
+	if lowLeft.Dimension() != upRight.Dimension() {
+		return nil, fmt.Errorf("length of lowLeft and upRight must match")
+	}
+	return &DoublePointRectangle{
+		lowLeft: lowLeft,
+		upRight: upRight,
+	}, nil
+}
+
+func (r *DoublePointRectangle) Dimension() int {
+	return r.lowLeft.Dimension()
+}
+
+// Union returns a new DoublePointRectangle that is the union of the current rectangle and another rectangle.
+func (r *DoublePointRectangle) Union(other *DoublePointRectangle) *DoublePointRectangle {
+	if r.Dimension() != other.Dimension() {
+		panic("Dimensions must match for union operation")
+	}
+	newLowLeft := make(DoublePoint, r.Dimension())
+	newUpRight := make(DoublePoint, r.Dimension())
+	for i := 0; i < r.Dimension(); i++ {
+		if r.lowLeft[i] < other.lowLeft[i] {
+			newLowLeft[i] = r.lowLeft[i]
+		} else {
+			newLowLeft[i] = other.lowLeft[i]
 		}
-		// read the lower left point
-		lowLeft := make([]float64, dimension)
-		// start from 2 and read 8 bytes at a time
-		startIndex := 2
-		for i := 0; i < int(dimension); i++ {
-			i64Bits := binary.BigEndian.Uint64(data[startIndex+i*8 : startIndex+(i+1)*8])
-			lowLeft[i] = math.Float64frombits(i64Bits)
+		if r.upRight[i] > other.upRight[i] {
+			newUpRight[i] = r.upRight[i]
+		} else {
+			newUpRight[i] = other.upRight[i]
 		}
-		// read the upper right point at position 2 + dimension * 8
-		startIndex = 2 + int(dimension)*8
-		upRight := make([]float64, dimension)
-		for i := 0; i < int(dimension); i++ {
-			i64Bits := binary.BigEndian.Uint64(data[startIndex+i*8 : startIndex+(i+1)*8])
-			upRight[i] = math.Float64frombits(i64Bits)
-		}
-		return DoublePointRectangle{
-			dimension: dimension,
-			lowLeft:   lowLeft,
-			upRight:   upRight,
-		}, nil
+	}
+	return &DoublePointRectangle{
+		lowLeft: newLowLeft,
+		upRight: newUpRight,
 	}
 }
 
-func getDoublePointRectangleSerFunc() utils.SerFunc[DoublePointRectangle] {
-	return func(s DoublePointRectangle, data []byte) (n int, err error) {
-		// length and capacity of the slice is 2 + 2 * dimension * 8
-		capacity := 2 + 2*int(s.dimension)*8
-		if cap(data) < capacity {
-			return 0, errors.New("not enough capacity")
-		}
-		// write the dimension
-		binary.BigEndian.PutUint16(data[:2], s.dimension)
-		// write the lower left point
-		startIndex := 2
-		for i := 0; i < int(s.dimension); i++ {
-			i64Bits := math.Float64bits(s.lowLeft[i])
-			binary.BigEndian.PutUint64(data[startIndex+i*8:startIndex+(i+1)*8], i64Bits)
-		}
-		// write the upper right point
-		startIndex = 2 + int(s.dimension)*8
-		for i := 0; i < int(s.dimension); i++ {
-			i64Bits := math.Float64bits(s.upRight[i])
-			binary.BigEndian.PutUint64(data[startIndex+i*8:startIndex+(i+1)*8], i64Bits)
-		}
-		return capacity, nil
+func (r *DoublePointRectangle) UnionInPlace(other *DoublePointRectangle) {
+	if r.Dimension() != other.Dimension() {
+		panic("Dimensions must match for union operation")
 	}
+	for i := 0; i < r.Dimension(); i++ {
+		if r.lowLeft[i] > other.lowLeft[i] {
+			r.lowLeft[i] = other.lowLeft[i]
+		}
+		if r.upRight[i] < other.upRight[i] {
+			r.upRight[i] = other.upRight[i]
+		}
+	}
+}
+
+// Intersects checks if the current rectangle intersects with another rectangle.
+func (r *DoublePointRectangle) Intersects(other *DoublePointRectangle) bool {
+	if len(r.lowLeft) != len(other.lowLeft) {
+		return false
+	}
+	// negate interval overlap condition
+	// ovrelap other.lowLeft[i] <= r.upRight[i] && other.upRight[i] >= r.lowLeft[i]
+	// negate   !(other.lowLeft[i] <= r.upRight[i]) || !( other.upRight[i] >= r.lowLeft[i])
+	// which is equivalent to
+	// other.lowLeft[i] > r.upRight[i] || other.upRight[i] < r.lowLeft[i]
+	for i := 0; i < len(r.lowLeft); i++ {
+		if other.lowLeft[i] > r.upRight[i] || other.upRight[i] < r.lowLeft[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Area calculates the area (or hypervolume) of the rectangle.
+func (r *DoublePointRectangle) Area() float64 {
+	area := 1.0
+	dimension := r.Dimension()
+	for i := 0; i < dimension; i++ {
+		area *= r.upRight[i] - r.lowLeft[i]
+	}
+	return area
+}
+
+// Clone creates a deep copy of the DoublePointRectangle.
+func (r *DoublePointRectangle) Clone() *DoublePointRectangle {
+	newLowLeft := make([]float64, r.Dimension())
+	newUpRight := make([]float64, r.Dimension())
+	copy(newLowLeft, r.lowLeft)
+	copy(newUpRight, r.upRight)
+	return &DoublePointRectangle{
+		lowLeft: newLowLeft,
+		upRight: newUpRight,
+	}
+}
+
+func (r *DoublePointRectangle) Equals(other *DoublePointRectangle) bool {
+	if r.Dimension() != other.Dimension() {
+		return false
+	}
+	for i := 0; i < r.Dimension(); i++ {
+		if r.lowLeft[i] != other.lowLeft[i] || r.upRight[i] != other.upRight[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *DoublePointRectangle) String() string {
+	result := "DoublePointRectangle{"
+	result += "lowLeft: ["
+	for i, val := range r.lowLeft {
+		if i > 0 {
+			result += ", "
+		}
+		result += fmt.Sprintf("%f", val)
+	}
+	result += "], "
+	result += "upRight: ["
+	for i, val := range r.upRight {
+		if i > 0 {
+			result += ", "
+		}
+		result += fmt.Sprintf("%f", val)
+	}
+	result += "]"
+	result += "}"
+	return result
 }
