@@ -311,6 +311,7 @@ func TestGoSortRunGenerator(t *testing.T) {
 		int32DSCmp,
 		int32DSCmp,
 		factory,
+		1,
 	)
 	createTmpFile := func(currentRunIndex int, index int) (*os.File, error) {
 		fileName := fmt.Sprintf("%s/%s_run_%06d_%03d.%s", directory, "sort", currentRunIndex, index, "tmp")
@@ -611,6 +612,7 @@ func TestSimpleInt64SortHeap(t *testing.T) {
 		cmpDeSer,
 		cmpDeSer,
 		writeFactory,
+		2,
 	)
 	sorter := NewSorter(
 		cmpDeSer,
@@ -678,6 +680,7 @@ func TestSimpleInt64Sort(t *testing.T) {
 		cmpDeSer,
 		cmpDeSer,
 		writeFactory,
+		2,
 	)
 	sorter := NewSorter(
 		cmpDeSer,
@@ -718,7 +721,7 @@ func TestSimpleInt64Sort(t *testing.T) {
 	}
 }
 
-func TestSimpleInt64SortLarge(t *testing.T) {
+func TestSimpleInt64SortLargeTournament(t *testing.T) {
 
 	if strings.Contains(t.Name(), "large") {
 		t.Skip("Local run test only")
@@ -730,13 +733,7 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 		int64Slice = append(int64Slice, int64(i))
 	}
 	int64Slice = permutate(int64Slice)
-	tests := []struct {
-		name string
-		heap bool
-	}{
-		{"Tournament", false},
-		{"Heap", true},
-	}
+	tests := []int{1, 2, 4, 6, 8, 10, 12}
 	prefix := "int64sort"
 	suffix := "tmp"
 	kWay := 64                                            // memory is 128 KB * 100 at least
@@ -751,75 +748,45 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 	cmpDeSer := Int64DSCmp{}
 	// start tests
 	for _, tt := range tests {
-		t.Logf("Running test: %s", tt.name)
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(fmt.Sprint("Tournament ", tt), func(t *testing.T) {
 			tmpDirectory := t.TempDir()
 			t.Logf("Using temp directory: %s", tmpDirectory)
 			var sortedSeq utils.CloseableIterator[int64]
 			var err error
-			if tt.heap {
-				runGenerator := NewGoStandarSortRunGenerator(
-					runSize,
-					runSize/8, // initial run size
-					cmpDeSer,
-					cmpDeSer,
-					cmpDeSer,
-					writeFactory,
-				)
-				sorter := NewSorter(
-					cmpDeSer,
-					cmpDeSer,
-					cmpDeSer,
-					HeapIteratorFactory[int64, Int64DSCmp],
-					runGenerator,
-					readFactory,
-					writeFactory,
-					tmpDirectory,
-					prefix,
-					suffix,
-					kWay,
-				)
-				start := time.Now()
-				sortedSeq, err = sorter.Sort(slices.Values(int64Slice))
-				if err != nil {
-					t.Fatalf("failed to sort: %v", err)
-				}
-				duration := time.Since(start)
-				t.Logf("Sort -1 merge %s", duration)
-			} else {
-				runGenerator := NewGoStandarSortRunGenerator(
-					runSize,
-					runSize/8, // initial run size
-					cmpDeSer,
-					cmpDeSer,
-					cmpDeSer,
-					writeFactory,
-				)
-				sorter := NewSorter(
-					cmpDeSer,
-					cmpDeSer,
-					cmpDeSer,
-					TournamentIteratorFactory[int64, Int64DSCmp],
-					runGenerator,
-					readFactory,
-					writeFactory,
-					tmpDirectory,
-					prefix,
-					suffix,
-					kWay,
-				)
-				start := time.Now()
-				sortedSeq, err = sorter.Sort(slices.Values(int64Slice))
-				if err != nil {
-					t.Fatalf("failed to sort: %v", err)
-				}
-				duration := time.Since(start)
-				t.Logf("Sort -1 merge %s", duration)
+			k := tt
+			runGenerator := NewGoStandarSortRunGenerator(
+				runSize,
+				runSize/8, // initial run size
+				cmpDeSer,
+				cmpDeSer,
+				cmpDeSer,
+				writeFactory,
+				k,
+			)
+			sorter := NewSorter(
+				cmpDeSer,
+				cmpDeSer,
+				cmpDeSer,
+				TournamentIteratorFactory[int64, Int64DSCmp],
+				runGenerator,
+				readFactory,
+				writeFactory,
+				tmpDirectory,
+				prefix,
+				suffix,
+				kWay,
+			)
+			start := time.Now()
+			sortedSeq, err = sorter.Sort(slices.Values(int64Slice))
+			if err != nil {
+				t.Fatalf("failed to sort: %v", err)
 			}
+			duration := time.Since(start)
+			t.Logf("Sort %s", duration)
 			// verify sorting
 			previous := int64(-1)
 			count := 0
-			start := time.Now()
+			start = time.Now()
 			for {
 				r, ok, err := sortedSeq.Next()
 				if !ok {
@@ -838,10 +805,91 @@ func TestSimpleInt64SortLarge(t *testing.T) {
 				t.Fatalf("expected to read %d records, but got %d", elementsCount, count)
 			}
 			sortedSeq.Close()
-			duration := time.Since(start)
+			duration = time.Since(start)
 			t.Logf("Last Merge %s", duration)
 		})
 	}
+}
+
+func TestSimpleInt64SortLargeHeap(t *testing.T) {
+	if strings.Contains(t.Name(), "large") {
+		t.Skip("Local run test only")
+	}
+	elementsCount := 100_000_000
+	int64Slice := make([]int64, 0, elementsCount)
+	for i := range elementsCount {
+		int64Slice = append(int64Slice, int64(i))
+	}
+	int64Slice = permutate(int64Slice)
+	prefix := "int64sort"
+	suffix := "tmp"
+	kWay := 64                                            // memory is 128 KB * 100 at least
+	runSize := 1024 * 1024 * 32                           // 32 MB Buffer
+	readBufferSize, writeBufferSize := 1024*512, 1024*512 // 512 KB
+	writeFactory := func(file *os.File, serialize utils.Serializer[int64]) io.TempFileWriter[int64] {
+		return io.NewFixedSizeTempFileWriter(file, writeBufferSize, 8, serialize)
+	}
+	readFactory := func(file *os.File, deserialize utils.Deserializer[int64]) (utils.CloseableIterator[int64], error) {
+		return io.NewTempFileIterator(file, readBufferSize, 8, deserialize)
+	}
+	cmpDeSer := Int64DSCmp{}
+	tmpDirectory := t.TempDir()
+	t.Logf("Using temp directory: %s", tmpDirectory)
+	var sortedSeq utils.CloseableIterator[int64]
+	var err error
+	runGenerator := NewGoStandarSortRunGenerator(
+		runSize,
+		runSize/8, // initial run size
+		cmpDeSer,
+		cmpDeSer,
+		cmpDeSer,
+		writeFactory,
+		2,
+	)
+	sorter := NewSorter(
+		cmpDeSer,
+		cmpDeSer,
+		cmpDeSer,
+		HeapIteratorFactory[int64, Int64DSCmp],
+		runGenerator,
+		readFactory,
+		writeFactory,
+		tmpDirectory,
+		prefix,
+		suffix,
+		kWay,
+	)
+	start := time.Now()
+	sortedSeq, err = sorter.Sort(slices.Values(int64Slice))
+	if err != nil {
+		t.Fatalf("failed to sort: %v", err)
+	}
+	duration := time.Since(start)
+	t.Logf("Sort %s", duration)
+	// verify sorting
+	previous := int64(-1)
+	count := 0
+	start = time.Now()
+	for {
+		r, ok, err := sortedSeq.Next()
+		if !ok {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		if r < previous {
+			t.Fatalf("expected %d, but got %d", previous, r)
+		}
+		previous = r
+		count++
+	}
+	if count != elementsCount {
+		t.Fatalf("expected to read %d records, but got %d", elementsCount, count)
+	}
+	sortedSeq.Close()
+	duration = time.Since(start)
+	t.Logf("Last Merge %s", duration)
 }
 
 // Simple Test iterator over slices

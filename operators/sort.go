@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/daniar-achakeev/paloo_db/io"
 	"github.com/daniar-achakeev/paloo_db/utils"
@@ -27,6 +28,273 @@ type MergeIteratorFactoryFunc[T any, C utils.Comparator[T]] func(iterators []uti
 // RunGenerator is an interface for generating sorted runs from an input sequence.
 type RunGenerator[T any, C utils.Comparator[T]] interface {
 	GenerateRuns(input iter.Seq[T], createTmpFile func(currentRunIndex int, index int) (*os.File, error)) error
+}
+
+// GoStandarSortRunGenerator uses golang standard slices.sort
+// runs on k-partitions and then merges using tournament sort if k > 1
+type GoStandarSortRunGenerator[T any, C utils.Comparator[T]] struct {
+	runSize               int // maximum size of each run in bytes
+	initialRunSize        int // estimated initial size of each run
+	sliceBuffer           []T //
+	comparatorFunc        C
+	getByteSize           utils.GetByteSize[T]
+	serialize             utils.Serializer[T]
+	tempFileWriterFactory func(file *os.File, serialize utils.Serializer[T]) io.TempFileWriter[T]
+	k                     int // number of parallel sorts
+}
+
+func NewGoStandarSortRunGenerator[T any, C utils.Comparator[T]](
+	runSize int,
+	initialRunSize int,
+	comparatorFunc C,
+	getByteSize utils.GetByteSize[T],
+	serialize utils.Serializer[T],
+	tempFileWriterFactory func(file *os.File, serialize utils.Serializer[T]) io.TempFileWriter[T],
+	k int,
+) *GoStandarSortRunGenerator[T, C] {
+	return &GoStandarSortRunGenerator[T, C]{
+		runSize:               runSize,
+		initialRunSize:        initialRunSize,
+		comparatorFunc:        comparatorFunc,
+		getByteSize:           getByteSize,
+		serialize:             serialize,
+		tempFileWriterFactory: tempFileWriterFactory,
+		sliceBuffer:           make([]T, 0, initialRunSize),
+		k:                     k,
+	}
+
+}
+
+func (g *GoStandarSortRunGenerator[T, C]) GenerateRuns(input iter.Seq[T], createTmpFile func(currentRunIndex int, index int) (*os.File, error)) error {
+	if input == nil {
+		return fmt.Errorf("input iterator is nil")
+	}
+	currentSizeBytes := 0
+	currentRunIndex := 0
+	for t := range input {
+		byteSize := g.getByteSize.GetByteSize(t)
+		addedSize := currentSizeBytes + byteSize
+		if addedSize > g.runSize {
+			if err := g.sortAndFlush(currentRunIndex, createTmpFile); err != nil {
+				return fmt.Errorf("failed to sort and flush: %v", err)
+			}
+			currentSizeBytes = 0
+			currentRunIndex++
+			g.sliceBuffer = nil // reset
+		}
+		if g.sliceBuffer == nil {
+			g.sliceBuffer = make([]T, 0, g.initialRunSize)
+		}
+		g.sliceBuffer = append(g.sliceBuffer, t)
+		currentSizeBytes += byteSize
+	}
+	// flush the remaining items
+	if len(g.sliceBuffer) > 0 {
+		if err := g.sortAndFlush(currentRunIndex, createTmpFile); err != nil {
+			return fmt.Errorf("failed to sort and flush remaining items: %v", err)
+		}
+	}
+	//
+	return nil
+}
+
+// sortAndFlush sorts the current sliceBuffer and writes to temp file
+func (g *GoStandarSortRunGenerator[T, C]) sortAndFlush(currentRunIndex int, createTmpFile func(currentRunIndex int, index int) (*os.File, error)) error {
+	var tIt utils.CloseableIterator[T]
+	if g.k > 1 { // parallel sort
+		var err error
+		var wg sync.WaitGroup
+		sliceResultCh := make(chan []T, g.k)
+		defer close(sliceResultCh)
+		partSize := (len(g.sliceBuffer) + g.k - 1) / g.k
+		for i, start := 0, 0; i < g.k; i, start = i+1, start+partSize {
+			end := min(start+partSize, len(g.sliceBuffer))
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				part := g.sliceBuffer[start:end]
+				slices.SortFunc(part, g.comparatorFunc.Compare)
+				sliceResultCh <- part
+			}()
+		}
+		wg.Wait() // sort all
+		its := make([]utils.CloseableIterator[T], g.k)
+		for i := range g.k {
+			sp := <-sliceResultCh
+			its[i] = utils.NewSliceIt(sp)
+		}
+		tIt, err = NewTournamentIt(its, g.comparatorFunc)
+		if err != nil {
+			return fmt.Errorf("merger problem %v", err)
+		}
+	} else { // single sort
+		slices.SortFunc(g.sliceBuffer, g.comparatorFunc.Compare)
+		tIt = utils.NewSliceIt(g.sliceBuffer)
+	}
+	// write to file
+	tmpFile, err := createTmpFile(currentRunIndex, 0)
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file: %v", err)
+	}
+	defer tmpFile.Close()
+	writer := g.tempFileWriterFactory(tmpFile, g.serialize)
+	if err := writer.Write(tIt); err != nil {
+		return fmt.Errorf("failed to write merged sequence to temporary file: %v", err)
+	}
+	return nil
+}
+
+// TNode: represents a node in the tournament tree used for k-way merging.
+type TNode[T any] struct {
+	value T   // value of the looser
+	idx   int // source index of the looser
+}
+
+func (t TNode[T]) String() string {
+	return fmt.Sprintf("TNode{value: %v, idx: %d}", t.value, t.idx)
+}
+
+// TournamentTree: a k-way merge algorithm using a tournament tree
+type TournamentTree[T any, C utils.Comparator[T]] struct {
+	tree   []TNode[T]
+	cmp    C
+	height int
+}
+
+func NewTournamentTree[T any, C utils.Comparator[T]](cmp C, fContestents []TNode[T]) *TournamentTree[T, C] {
+	k := len(fContestents)
+	height := 0
+	for (1 << height) < k {
+		height++
+	}
+	tree := make([]TNode[T], 1<<height)
+	for i := 0; i < cap(tree); i++ {
+		tree[i] = TNode[T]{value: utils.Zero[T](), idx: -1} // all sentinel
+	}
+	cand := make([]TNode[T], 0, len(fContestents))
+	cand = append(cand, fContestents...)
+	for h := height - 1; h >= 0; h-- {
+		start := 1 << h
+		winners := make([]TNode[T], 0, 1<<h)
+		for i := 0; i < len(cand); i, start = i+2, start+1 {
+			if i+1 >= len(cand) {
+				winners = append(winners, cand[i]) // winner
+				tree[start] = TNode[T]{idx: -1}    // loser
+				continue
+			}
+			if cand[i].idx == -1 && cand[i+1].idx == -1 {
+				winners = append(winners, TNode[T]{idx: -1}) // winner
+				tree[start] = TNode[T]{idx: -1}              // loser
+				continue
+			}
+			if cand[i].idx == -1 && cand[i+1].idx != -1 {
+				winners = append(winners, cand[i+1]) //winner
+				tree[start] = TNode[T]{idx: -1}      // loser
+				continue
+			}
+			if cand[i].idx != -1 && cand[i+1].idx == -1 {
+				winners = append(winners, cand[i]) //winner
+				tree[start] = TNode[T]{idx: -1}    // loser
+				continue
+			}
+			if cmp.Compare(cand[i].value, cand[i+1].value) < 0 {
+				winners = append(winners, cand[i])
+				tree[start] = cand[i+1]
+			} else {
+				winners = append(winners, cand[i+1])
+				tree[start] = cand[i]
+			}
+		}
+		cand = winners
+	}
+	tree[0] = cand[0] // // set winner
+	return &TournamentTree[T, C]{tree: tree, cmp: cmp, height: height}
+}
+
+// Winner returns the current winner of the tournament
+func (t *TournamentTree[T, C]) Winner() (winner TNode[T], ok bool) {
+	return t.tree[0], t.tree[0].idx != -1
+}
+
+// Challenge updates the tournament tree with a new challenger
+func (t *TournamentTree[T, C]) Challenge(challenger TNode[T], index int) {
+	w := challenger
+	pIdx := (len(t.tree) + index) / 2
+	for pIdx >= 1 {
+		p := t.tree[pIdx] //
+		if p.idx == -1 {  // sentinel
+			pIdx /= 2
+			continue
+		}
+		if w.idx == -1 || t.cmp.Compare(w.value, p.value) >= 0 { // sentinel
+			w, t.tree[pIdx] = p, w // swap
+		}
+		pIdx /= 2
+	}
+	t.tree[0] = w
+}
+
+type TournamentIterator[T any, C utils.Comparator[T]] struct {
+	tt        *TournamentTree[T, C]
+	iterators []utils.CloseableIterator[T]
+}
+
+func NewTournamentIt[T any, C utils.Comparator[T]](iterators []utils.CloseableIterator[T], cmp C) (*TournamentIterator[T, C], error) {
+	contestents := make([]TNode[T], len(iterators))
+	for i, it := range iterators {
+		r, ok, err := it.Next()
+		if !ok {
+			contestents[i] = TNode[T]{idx: -1} // sentinel
+			it.Close()
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		contestents[i] = TNode[T]{value: r, idx: i}
+	}
+	tournament := NewTournamentTree(cmp, contestents)
+	return &TournamentIterator[T, C]{
+		tt:        tournament,
+		iterators: iterators,
+	}, nil
+}
+
+func (m *TournamentIterator[T, C]) Next() (T, bool, error) {
+	t, ok := m.tt.Winner()
+	if !ok { // stop sentinel winner
+		return t.value, ok, nil
+	}
+	nt, ok, err := m.iterators[t.idx].Next()
+	if err != nil {
+		return t.value, false, err
+	}
+	if !ok { // source exhausted
+		m.tt.Challenge(TNode[T]{idx: -1}, t.idx)
+	} else {
+		m.tt.Challenge(TNode[T]{value: nt, idx: t.idx}, t.idx)
+	}
+	return t.value, true, nil
+}
+
+func (m *TournamentIterator[T, C]) Close() error {
+	cErrs := make([]error, len(m.iterators))
+	hasErr := false
+	for i, it := range m.iterators {
+		if err := it.Close(); err != nil {
+			cErrs[i] = err
+			hasErr = true
+		}
+	}
+	if hasErr {
+		return fmt.Errorf("close errors %w", errors.Join(cErrs...))
+	}
+	return nil
+}
+
+func TournamentIteratorFactory[T any, C utils.Comparator[T]](iterators []utils.CloseableIterator[T], cmp C) (utils.CloseableIterator[T], error) {
+	it, err := NewTournamentIt(iterators, cmp)
+	return it, err
 }
 
 // Sorter is a generic external sorter that can sort large datasets that do not fit into memory.
@@ -222,242 +490,4 @@ func (s *Sorter[T, C]) Close() error {
 	// FIXME: Implement any necessary cleanup logic here
 	// removes all files in the directory with the same prefix
 	return nil
-}
-
-// GoStandarSortRunGenerator uses golang standard slices.sort
-// wraps into func the comparator not so fast no inlining
-type GoStandarSortRunGenerator[T any, C utils.Comparator[T]] struct {
-	runSize               int // maximum size of each run in bytes
-	initialRunSize        int // estimated initial size of each run
-	sliceBuffer           []T //
-	comparatorFunc        C
-	getByteSize           utils.GetByteSize[T]
-	serialize             utils.Serializer[T]
-	tempFileWriterFactory func(file *os.File, serialize utils.Serializer[T]) io.TempFileWriter[T]
-}
-
-func NewGoStandarSortRunGenerator[T any, C utils.Comparator[T]](
-	runSize int,
-	initialRunSize int,
-	comparatorFunc C,
-	getByteSize utils.GetByteSize[T],
-	serialize utils.Serializer[T],
-	tempFileWriterFactory func(file *os.File, serialize utils.Serializer[T]) io.TempFileWriter[T],
-) *GoStandarSortRunGenerator[T, C] {
-	return &GoStandarSortRunGenerator[T, C]{
-		runSize:               runSize,
-		initialRunSize:        initialRunSize,
-		comparatorFunc:        comparatorFunc,
-		getByteSize:           getByteSize,
-		serialize:             serialize,
-		tempFileWriterFactory: tempFileWriterFactory,
-		sliceBuffer:           make([]T, 0, initialRunSize),
-	}
-
-}
-
-func (g *GoStandarSortRunGenerator[T, C]) GenerateRuns(input iter.Seq[T], createTmpFile func(currentRunIndex int, index int) (*os.File, error)) error {
-	if input == nil {
-		return fmt.Errorf("input iterator is nil")
-	}
-	currentSizeBytes := 0
-	currentRunIndex := 0
-	for t := range input {
-		byteSize := g.getByteSize.GetByteSize(t)
-		addedSize := currentSizeBytes + byteSize
-		if addedSize > g.runSize {
-			// sort and flush
-			if err := g.sortAndFlush(currentRunIndex, createTmpFile); err != nil {
-				return fmt.Errorf("failed to sort and flush: %v", err)
-			}
-			currentSizeBytes = 0
-			currentRunIndex++
-			// reset the slice buffer
-			g.sliceBuffer = nil
-		}
-		if g.sliceBuffer == nil {
-			g.sliceBuffer = make([]T, 0, g.initialRunSize)
-		}
-		g.sliceBuffer = append(g.sliceBuffer, t)
-		currentSizeBytes += byteSize
-	}
-	// flush the remaining items
-	if len(g.sliceBuffer) > 0 {
-		if err := g.sortAndFlush(currentRunIndex, createTmpFile); err != nil {
-			return fmt.Errorf("failed to sort and flush remaining items: %v", err)
-		}
-	}
-	//
-	return nil
-}
-
-// sortAndFlush sorts the current sliceBuffer and writes to temp file
-func (g *GoStandarSortRunGenerator[T, C]) sortAndFlush(currentRunIndex int, createTmpFile func(currentRunIndex int, index int) (*os.File, error)) error {
-	var err error
-	// Sort the entire sliceBuffer
-	// NOTE: FIXME currently we use a wrapper around the comparator function
-	slices.SortFunc(g.sliceBuffer, g.comparatorFunc.Compare)
-	tmpFile, err := createTmpFile(currentRunIndex, 0)
-	if err != nil {
-		return fmt.Errorf("failed to create temporary file: %v", err)
-	}
-	defer tmpFile.Close()
-	writer := g.tempFileWriterFactory(tmpFile, g.serialize)
-	if err := writer.WriteSeq(slices.Values(g.sliceBuffer)); err != nil {
-		return fmt.Errorf("failed to write merged sequence to temporary file: %v", err)
-	}
-	return nil
-}
-
-// TNode: represents a node in the tournament tree used for k-way merging.
-type TNode[T any] struct {
-	value T   // value of the looser
-	idx   int // source index of the looser
-}
-
-func (t TNode[T]) String() string {
-	return fmt.Sprintf("TNode{value: %v, idx: %d}", t.value, t.idx)
-}
-
-// TournamentTree: a k-way merge algorithm using a tournament tree
-type TournamentTree[T any, C utils.Comparator[T]] struct {
-	tree   []TNode[T]
-	cmp    C
-	height int
-}
-
-func NewTournamentTree[T any, C utils.Comparator[T]](cmp C, fContestents []TNode[T]) *TournamentTree[T, C] {
-	k := len(fContestents)
-	height := 0
-	for (1 << height) < k {
-		height++
-	}
-	tree := make([]TNode[T], 1<<height)
-	for i := 0; i < cap(tree); i++ {
-		tree[i] = TNode[T]{value: utils.Zero[T](), idx: -1} // all sentinel
-	}
-	cand := make([]TNode[T], 0, len(fContestents))
-	cand = append(cand, fContestents...)
-	for h := height - 1; h >= 0; h-- {
-		start := 1 << h
-		winners := make([]TNode[T], 0, 1<<h)
-		for i := 0; i < len(cand); i, start = i+2, start+1 {
-			if i+1 >= len(cand) {
-				winners = append(winners, cand[i]) // winner
-				tree[start] = TNode[T]{idx: -1}    // loser
-				continue
-			}
-			if cand[i].idx == -1 && cand[i+1].idx == -1 {
-				winners = append(winners, TNode[T]{idx: -1}) // winner
-				tree[start] = TNode[T]{idx: -1}              // loser
-				continue
-			}
-			if cand[i].idx == -1 && cand[i+1].idx != -1 {
-				winners = append(winners, cand[i+1]) //winner
-				tree[start] = TNode[T]{idx: -1}      // loser
-				continue
-			}
-			if cand[i].idx != -1 && cand[i+1].idx == -1 {
-				winners = append(winners, cand[i]) //winner
-				tree[start] = TNode[T]{idx: -1}    // loser
-				continue
-			}
-			if cmp.Compare(cand[i].value, cand[i+1].value) < 0 {
-				winners = append(winners, cand[i])
-				tree[start] = cand[i+1]
-			} else {
-				winners = append(winners, cand[i+1])
-				tree[start] = cand[i]
-			}
-		}
-		cand = winners
-	}
-	tree[0] = cand[0] // // set winner
-	return &TournamentTree[T, C]{tree: tree, cmp: cmp, height: height}
-}
-
-// Winner returns the current winner of the tournament
-func (t *TournamentTree[T, C]) Winner() (winner TNode[T], ok bool) {
-	return t.tree[0], t.tree[0].idx != -1
-}
-
-// Challenge updates the tournament tree with a new challenger
-func (t *TournamentTree[T, C]) Challenge(challenger TNode[T], index int) {
-	w := challenger
-	pIdx := (len(t.tree) + index) / 2
-	for pIdx >= 1 {
-		p := t.tree[pIdx] //
-		if p.idx == -1 {  // sentinel
-			pIdx /= 2
-			continue
-		}
-		if w.idx == -1 || t.cmp.Compare(w.value, p.value) >= 0 { // sentinel
-			w, t.tree[pIdx] = p, w // swap
-		}
-		pIdx /= 2
-	}
-	t.tree[0] = w
-}
-
-type TournamentIterator[T any, C utils.Comparator[T]] struct {
-	tt        *TournamentTree[T, C]
-	iterators []utils.CloseableIterator[T]
-}
-
-func NewTournamentIt[T any, C utils.Comparator[T]](iterators []utils.CloseableIterator[T], cmp C) (*TournamentIterator[T, C], error) {
-	contestents := make([]TNode[T], len(iterators))
-	for i, it := range iterators {
-		r, ok, err := it.Next()
-		if !ok {
-			contestents[i] = TNode[T]{idx: -1} // sentinel
-			it.Close()
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		contestents[i] = TNode[T]{value: r, idx: i}
-	}
-	tournament := NewTournamentTree(cmp, contestents)
-	return &TournamentIterator[T, C]{
-		tt:        tournament,
-		iterators: iterators,
-	}, nil
-}
-
-func (m *TournamentIterator[T, C]) Next() (T, bool, error) {
-	t, ok := m.tt.Winner()
-	if !ok { // stop sentinel winner
-		return t.value, ok, nil
-	}
-	nt, ok, err := m.iterators[t.idx].Next()
-	if err != nil {
-		return t.value, false, err
-	}
-	if !ok { // source exhausted
-		m.tt.Challenge(TNode[T]{idx: -1}, t.idx)
-	} else {
-		m.tt.Challenge(TNode[T]{value: nt, idx: t.idx}, t.idx)
-	}
-	return t.value, true, nil
-}
-
-func (m *TournamentIterator[T, C]) Close() error {
-	cErrs := make([]error, len(m.iterators))
-	hasErr := false
-	for i, it := range m.iterators {
-		if err := it.Close(); err != nil {
-			cErrs[i] = err
-			hasErr = true
-		}
-	}
-	if hasErr {
-		return fmt.Errorf("close errors %w", errors.Join(cErrs...))
-	}
-	return nil
-}
-
-func TournamentIteratorFactory[T any, C utils.Comparator[T]](iterators []utils.CloseableIterator[T], cmp C) (utils.CloseableIterator[T], error) {
-	it, err := NewTournamentIt(iterators, cmp)
-	return it, err
 }
