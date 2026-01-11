@@ -61,3 +61,28 @@ func IteratorToSeq[T any](it Iterator[T]) iter.Seq[T] {
 		}
 	}
 }
+
+type SliceIt[T any] struct {
+	idx int
+	s   []T
+}
+
+func NewSliceIt[T any](slice []T) *SliceIt[T] {
+	return &SliceIt[T]{
+		idx: 0,
+		s:   slice,
+	}
+}
+
+func (s *SliceIt[T]) Next() (T, bool, error) {
+	if s.idx < len(s.s) {
+		next := s.s[s.idx]
+		s.idx++
+		return next, true, nil
+	}
+	return Zero[T](), false, nil
+}
+
+func (s *SliceIt[T]) Close() error {
+	return nil
+}
