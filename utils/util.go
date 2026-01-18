@@ -1,7 +1,10 @@
 // Provides utils to work with I/O and serialization
 package utils
 
-import "iter"
+import (
+	"cmp"
+	"iter"
+)
 
 // Zero element for generic types
 func Zero[T any]() T {
@@ -19,6 +22,12 @@ type DeSerFunc[T any] func(data []byte) (st T, err error)
 // for inline implementations
 type Comparator[T any] interface {
 	Compare(a, b T) int
+}
+
+type CmpFunc[T cmp.Ordered] func(a, b T) int
+
+func (c CmpFunc[T]) Compare(a, b T) int {
+	return c(a, b)
 }
 
 // Function to get the byte size of an item
